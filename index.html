@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#05060d" />
+  <title>指尖花开 · 手势控制粒子花朵</title>
+
+  <link rel="stylesheet" href="./style.css" />
+
+  <!-- Three.js（CDN，免构建）。用 npm + Vite 时删掉这段 importmap 即可 -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <!-- 1) 3D 画布 -->
+  <canvas id="gl"></canvas>
+
+  <!-- 2) 摄像头视频（隐藏数据源）+ 背景镜像画布 + 骨架画布 -->
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="bg"></canvas>
+  <canvas id="overlay"></canvas>
+
+  <!-- 3) 左上角标题 -->
+  <header class="title-card">
+    <h1>指尖花开</h1>
+    <p>MediaPipe Hands · Three.js 粒子花朵</p>
+  </header>
+
+  <!-- 4) 右上角控件：模式切换 / 重试摄像头 / 面板开关 -->
+  <div class="top-actions">
+    <div class="seg" role="group" aria-label="输入模式">
+      <button id="btnHand" class="seg-btn active" type="button">手势模式</button>
+      <button id="btnMouse" class="seg-btn" type="button">鼠标模式</button>
+    </div>
+    <div class="seg" id="presetSeg" role="group" aria-label="视觉预设"></div>
+    <button id="btnRetry" class="ghost-btn" type="button" title="重新请求摄像头">重试摄像头</button>
+    <button id="btnPanel" class="icon-btn" type="button" title="参数面板（H）" aria-label="参数面板">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/>
+        <path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1M15.9 15.9L18 18M18 6l-2.1 2.1M8.1 15.9L6 18"
+              stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- 5) 实时参数面板（右侧，可折叠；内容由 main.js 按 PARAM_DEFS 生成） -->
+  <aside id="panel" class="panel open">
+    <div class="panel-head">
+      <strong>实时参数</strong>
+      <span id="camBadge" class="badge">摄像头就绪</span>
+    </div>
+    <div id="panelBody" class="panel-body"></div>
+  </aside>
+
+  <!-- 6) 左下角 HUD -->
+  <div id="hud" class="hud">
+    <div class="hud-row"><span>模式</span><b id="hudMode">手势模式</b></div>
+    <div class="hud-row"><span>tension</span><b id="hudTension">0.500</b></div>
+    <div class="hud-bar"><i id="barTension" style="width:50%"></i></div>
+    <div class="hud-row"><span>绽放度</span><b id="hudBloom">0.500</b></div>
+    <div class="hud-bar bloom"><i id="barBloom" style="width:50%"></i></div>
+    <div class="hud-row"><span>手部</span><b id="hudHand">未识别</b></div>
+    <div class="hud-row"><span>性能</span><b id="hudFps">60 FPS</b></div>
+    <div class="hud-keys">
+      [M] 切换模式 · [H] 面板 · [R] 恢复初始状态<br />
+      左手区 = 花苞，右手区 = 绽放；滚轮缩放，左键旋转，右键平移，双击复位
+    </div>
+    <div class="hud-note" id="hdUnavailable" hidden>摄像头不可用：已进入鼠标模式</div>
+  </div>
+
+  <!-- 7) 右下角：恢复初始状态 -->
+  <button id="btnReset" class="reset-btn" type="button">⟲ 恢复初始状态</button>
+
+  <!-- 8) 提示条 -->
+  <div id="toast" class="toast" role="alert" aria-live="polite"></div>
+  <div id="cursorDot" class="cursor-dot"></div>
+
+  <!-- 9) MediaPipe Hands（UMD，挂 window.Hands） -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
