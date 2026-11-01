@@ -24,10 +24,12 @@
   <!-- 1) 3D 画布 -->
   <canvas id="gl"></canvas>
 
-  <!-- 2) 摄像头视频（隐藏数据源）+ 背景镜像画布 + 骨架画布 -->
-  <video id="video" playsinline autoplay muted></video>
-  <canvas id="bg"></canvas>
-  <canvas id="overlay"></canvas>
+  <!-- 2) 左上角摄像头小窗：镜像视频 + 手部骨架（DOM 层，不进 WebGL） -->
+  <div id="camPreview" class="cam-preview">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="overlay"></canvas>
+    <span class="cam-tag">摄像头 · 手部骨架</span>
+  </div>
 
   <!-- 3) 左上角标题 -->
   <header class="title-card">
@@ -72,6 +74,7 @@
     <div class="hud-row"><span>性能</span><b id="hudFps">60 FPS</b></div>
     <div class="hud-keys">
       [M] 切换模式 · [H] 面板 · [R] 恢复初始状态<br />
+      伸出三根手指 = Love 彩蛋（或按 [L]）<br />
       左手区 = 花苞，右手区 = 绽放；滚轮缩放，左键旋转，右键平移，双击复位
     </div>
     <div class="hud-note" id="hdUnavailable" hidden>摄像头不可用：已进入鼠标模式</div>

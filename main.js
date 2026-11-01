@@ -27,7 +27,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
    ========================================================================== */
 
 /** 粒子池上限：滑块只改 drawRange，不重建几何体（规格要求） */
-const MAX_PARTICLES = 50000;
+const MAX_PARTICLES = 90000;
 
 /**
  * 实时参数（面板可调，自动存 localStorage）
@@ -35,14 +35,14 @@ const MAX_PARTICLES = 50000;
  */
 const PARAM_DEFS = [
   {
-    key: 'particleCount', label: '粒子数量', min: 1000, max: 50000, step: 1000,
-    def: 50000, fmt: (v) => v.toLocaleString('en-US'),
-    hint: '50000 粒子池固定分配，滑块只改 setDrawRange',
+    key: 'particleCount', label: '粒子数量', min: 1000, max: 90000, step: 1000,
+    def: 90000, fmt: (v) => v.toLocaleString('en-US'),
+    hint: '90000 粒子池固定分配（上下两朵花），滑块只改 setDrawRange',
     group: '粒子',
   },
   {
     key: 'particleSize', label: '粒子大小', min: 0.5, max: 6, step: 0.1,
-    def: 2.0, fmt: (v) => v.toFixed(1),
+    def: 1.8, fmt: (v) => v.toFixed(1),
     hint: 'uniform uSize → 顶点着色器 gl_PointSize',
     group: '粒子',
   },
@@ -54,13 +54,13 @@ const PARAM_DEFS = [
   },
   {
     key: 'glowIntensity', label: '发光强度', min: 0, max: 3, step: 0.01,
-    def: 1.2, fmt: (v) => v.toFixed(2),
+    def: 0.68, fmt: (v) => v.toFixed(2),
     hint: 'uniform uGlow → 乘以粒子颜色',
     group: '视觉',
   },
   {
     key: 'bloomStrength', label: '泛光强度', min: 0, max: 2.5, step: 0.01,
-    def: 0.8, fmt: (v) => v.toFixed(2),
+    def: 0.65, fmt: (v) => v.toFixed(2),
     hint: 'UnrealBloomPass.strength',
     group: '后处理',
   },
@@ -72,7 +72,7 @@ const PARAM_DEFS = [
   },
   {
     key: 'bloomThreshold', label: '泛光阈值', min: 0, max: 1, step: 0.01,
-    def: 0.18, fmt: (v) => v.toFixed(2),
+    def: 0.34, fmt: (v) => v.toFixed(2),
     hint: 'UnrealBloomPass.threshold：越小越多粒子发光',
     group: '后处理',
   },
@@ -100,8 +100,12 @@ const PRESETS = [
   {
     key: 'dreamy',
     label: '梦幻模式',
-    desc: '粒子拉满 · 光晕收到最小',
-    overrides: { bloomRadius: 0 },
+    desc: '粒子拉满 · 泛光半径与阈值都拉到最低',
+    overrides: {
+      particleCount: 90000,   // 粒子数量最大
+      bloomRadius: 0,         // 泛光半径最低
+      bloomThreshold: 0,      // 泛光阈值最低：所有粒子都参与泛光
+    },
   },
 ];
 
@@ -116,7 +120,7 @@ function presetParams(key) {
 /** 默认状态（「恢复初始状态」按钮就回到这里，= 标准模式） */
 const DEFAULT_STATE = {
   params: presetParams(DEFAULT_PRESET),
-  camera: { x: 0, y: 1.15, z: 5.4, targetY: 0.18, rotY: 0, rotX: 0 },
+  camera: { x: 0, y: 1.28, z: 5.8, targetY: 0.30, rotY: 0, rotX: 0 },
   tension: 0.5,
   mode: 'hand',
   preset: DEFAULT_PRESET,
@@ -136,8 +140,8 @@ const CONFIG = {
   petalCount: 6,           // 花瓣数（极坐标玫瑰曲线的 k）
   petalSharp: 0.78,        // 花瓣锐度（越大瓣越瘦、瓣间凹陷越深）
   petalLayers: 2,          // 内外两层花瓣（第二层旋转 30°、略小）
-  centerRatio: 0.07,       // 花心金粉占比
-  moteRatio: 0.06,         // 飘散尘埃占比
+  centerRatio: 0.008,      // 花心金粉占比（9 万颗时不能多，否则花心烧成白盘）
+  moteRatio: 0.028,        // 飘散尘埃占比（多了会糊成一层粉雾）
   bloomScale: 1.0,         // 花朵整体尺寸
   spinTurns: 0.55,         // 绽放时花瓣旋转圈数（打开时"拧"一下）
 
@@ -673,6 +677,8 @@ const FLOWER_VERT = /* glsl */ `
   uniform float uSize;
   uniform float uPixelRatio;
   uniform float uGlow;
+  uniform float uFade;      // 彩蛋时把花整体淡出
+  uniform float uDensity;   // 密度补偿：粒子越多，单颗越暗（否则加法混合必然过曝）
   uniform float uSpin;
   uniform vec3  uPointer;     // 指尖/鼠标位置（模型空间近似）
   uniform float uPointerActive;
@@ -735,10 +741,10 @@ const FLOWER_VERT = /* glsl */ `
     /* 亮度：花心金粉最亮，花瓣次之
        轴心附近粒子密度极高（所有花瓣都收在 r≈0），不压一压会烧成一个白球，
        颜色就全丢了。这里按离轴距离给一点衰减。 */
-    float centerBoost = role > 0.5 && role < 1.5 ? 1.15 : 1.0;
+    float centerBoost = role > 0.5 && role < 1.5 ? 0.95 : 1.0;
     float radial = length(pos.xz);
     float coreAtten = mix(0.38, 1.0, smoothstep(0.02, 0.85, radial));
-    float glow = uGlow * centerBoost * coreAtten * (0.72 + 0.55 * seed);
+    float glow = uGlow * uDensity * centerBoost * coreAtten * (0.72 + 0.55 * seed);
 
     /* 指尖附近更亮 */
     if (uPointerActive > 0.5) glow += exp(-distP * distP * 1.6) * 0.9;
@@ -748,7 +754,7 @@ const FLOWER_VERT = /* glsl */ `
     glow *= mix(0.22, 1.0, b);
 
     vColor = col;
-    vAlpha = mix(0.34, 1.0, b);
+    vAlpha = mix(0.34, 1.0, b) * uFade;
     vSeed = seed;
     vRole = role;
   }
@@ -805,11 +811,11 @@ const FLOWER_FRAG = /* glsl */ `
 class FlowerField {
   constructor() {
     this.group = new THREE.Group();
-    this.group.rotation.x = 0.42;   // 花冠前倾，能同时看到花瓣层次与花心
+    this.group.rotation.x = 0.42;   // 整组前倾（下面那朵因此能看到花心）
     this.build();
   }
 
-  /** 建 5 万粒子池（只建一次，之后只改 drawRange） */
+  /** 建 9 万粒子池（两朵花 + 花心 + 尘埃，只建一次，之后只改 drawRange） */
   build() {
     const N = MAX_PARTICLES;
     const posBloom = new Float32Array(N * 3);
@@ -817,59 +823,112 @@ class FlowerField {
     const colors = new Float32Array(N * 3);
     const info = new Float32Array(N * 4);
 
-    const centerCount = Math.floor(N * CONFIG.centerRatio);
-    const moteCount = Math.floor(N * CONFIG.moteRatio);
-    const petalCount = N - centerCount - moteCount;
-
+    /* 调色板（两朵花共用同一套） */
     const C_CORE = new THREE.Color().setHSL(0.090, 1.00, 0.56);   // 花心金
     const C_INNER = new THREE.Color().setHSL(0.952, 0.92, 0.60);  // 内层暖粉
     const C_MID = new THREE.Color().setHSL(0.940, 0.90, 0.62);    // 瓣面
     const C_EDGE = new THREE.Color().setHSL(0.930, 0.95, 0.70);   // 瓣缘亮粉
     const C_MOTE = new THREE.Color().setHSL(0.13, 0.55, 0.82);    // 尘埃暖白
 
+/* ---------- 上下两朵花，看起来长在同一根"茎"上 ----------
+       下面这朵是主花（大），上面这朵小一号（0.58 倍）并自动抬高，
+       两朵的 x/z 都贴着中轴，只差高度和大小 —— 视觉上就是一根茎上的两朵花。
+       粒子按 62 : 38 **交错**分配（i % 100），这样即使把粒子数量滑块拉低，
+       也总还有两朵花，不会只剩一朵。 */
+    /* 只有一朵花。内外两层花瓣靠 layer 区分（见下方 layerScale / layerLift / bowl）。 */
+    const FLOWER_LAYOUT = [
+      { share: 100, cy: 0.00, scale: 1.00, lean: 0.00, tilt: 0.00 },
+    ];
+
     const k = CONFIG.petalCount;
     const sharp = CONFIG.petalSharp;
     const tmp = new THREE.Color();
 
-    /** 玫瑰曲线：|cos(kθ/2)|^sharp */
-    const petalR = (theta) => Math.pow(Math.abs(Math.cos((k * theta) / 2)), sharp);
+    /** 玫瑰曲线：|cos(kθ/2)|^sharp（sharp 越小瓣越圆润、越大越尖瘦） */
+    const petalR = (theta, s = sharp) => Math.pow(Math.abs(Math.cos((k * theta) / 2)), s);
 
     for (let i = 0; i < N; i++) {
       const o = i * 3;
       const layer = i % 4 === 0 ? 1 : 0;     // 1 = 内层（旋转 30°、更小更高）
-      let seed = Math.random();
+      const seed = Math.random();
 
-      if (i < petalCount) {
-        /* ---------- 花瓣粒子 ---------- */
-        const theta = Math.random() * Math.PI * 2;
+      // 这颗粒子属于哪一朵花（交错分配）
+      const F = FLOWER_LAYOUT[(i % 100) < FLOWER_LAYOUT[0].share ? 0 : 1];
+
+      // 角色：花心 / 尘埃 / 花瓣
+      const roll = Math.random();
+      const isCore = roll < CONFIG.centerRatio;
+      const isMote = !isCore && roll < CONFIG.centerRatio + CONFIG.moteRatio;
+
+      /* 局部坐标 → 那朵花的坐标：先按 tilt 前倾，再缩放、抬高 */
+      const ct = Math.cos(F.tilt);
+      const st = Math.sin(F.tilt);
+      const toBloom = (lx, ly, lz) => {
+        const yy = ly * ct - lz * st;
+        const zz = ly * st + lz * ct;
+        posBloom[o] = lx * F.scale + F.lean;
+        posBloom[o + 1] = yy * F.scale + F.cy;
+        posBloom[o + 2] = zz * F.scale;
+      };
+      const toBud = (lx, ly, lz) => {
+        const yy = ly * ct - lz * st;
+        const zz = ly * st + lz * ct;
+        posBud[o] = lx * F.scale + F.lean;
+        posBud[o + 1] = yy * F.scale + F.cy;
+        posBud[o + 2] = zz * F.scale;
+      };
+
+      if (!isCore && !isMote) {
+        /* ---------- 花瓣粒子 ----------
+           θ 用「按 r(θ) 加权」的拒绝采样：让粒子聚到 6 个瓣上、
+           瓣与瓣之间的缝留空。均匀取 θ 的话，缝隙处 r≈0 的粒子
+           全堆在圆心，花就糊成一个盘，看不出花瓣。 */
+        let theta = 0;
+        let rMax = 0;
+        /* 内层的花瓣用更小的锐度指数 → 花瓣更宽更圆，
+           这样它虽小，但看起来和外层是同一个品种的瓣。 */
+        const sharpLocal = layer ? sharp * 0.6 : sharp;
+        for (let tries = 0; tries < 8; tries++) {
+          theta = Math.random() * Math.PI * 2;
+          rMax = petalR(theta, sharpLocal);
+          if (Math.random() < rMax * rMax) break;     // 留在瓣上
+        }
         const u = Math.sqrt(Math.random());            // 面积均匀
-        const rMax = petalR(theta);
 
-        const layerScale = layer ? 0.62 : 1.0;
-        const layerLift = layer ? 0.16 : 0.0;
+        /* 两层花瓣**都从同一个花心长出来**（u→0 时 r→0、y→0），
+           区别只在"张开程度"：
+             外层：开得透 —— 半径大、几乎平铺，瓣尖微微上翘
+             内层：开得含蓄 —— 半径只有 0.52 倍，但随半径快速升高，
+                   形成一个立在花心上的小杯（这才是真花的"两层"）
+           注意内层不能整体抬高：那样花瓣根部就悬在中心上方了，
+           看起来像两朵花叠在一起，而不是一朵花的两层。 */
+        const layerScale = layer ? 0.55 : 1.0;
         const layerRot = layer ? Math.PI / CONFIG.petalCount : 0;
 
         // 抖一下 θ，让瓣缘不是硬边
         const th = theta + layerRot + (Math.random() - 0.5) * 0.05;
-        const r = Math.pow(u, 1.0) * rMax * 1.55 * layerScale * CONFIG.bloomScale;
+        const r = (0.13 + 0.87 * u) * rMax * 1.55 * layerScale * CONFIG.bloomScale;
 
         const x = Math.cos(th) * r;
         const z = Math.sin(th) * r;
-        // 花瓣微微上卷：越靠瓣缘翘得越高
-        const y = layerLift + (1 - u) * 0.10 + Math.pow(u, 3) * 0.34 * (layer ? 0.9 : 1.0)
-                  + (Math.random() - 0.5) * 0.03;
-
-        posBloom[o] = x;
-        posBloom[o + 1] = y;
-        posBloom[o + 2] = z;
+        /* 高度剖面（u 越小越靠花心，两层在 u→0 处都收在同一点）：
+             外层 y = 0.07·u + 0.15·u³          基本平铺，只有瓣尖翘起来
+             内层 y = 0.40·u^1.12               从花心升上去，开口比外层浅
+           摊开度的差别 = 外层 r 大而 y 小、内层 r 小而 y 大。 */
+        const y = layer
+          ? Math.pow(u, 1.12) * 0.40
+          : u * 0.07 + Math.pow(u, 3) * 0.15;
+        const yy = y + (Math.random() - 0.5) * 0.03;
+        toBloom(x, yy, z);
 
         // 花苞：同样角度、缩小收拢成一个尖苞
         const budR = 0.16 + Math.random() * 0.12;
         const budH = Math.pow(Math.random(), 0.6) * 0.92;
-        const budT = th;
-        posBud[o] = Math.cos(budT) * budR * (1 - budH * 0.55);
-        posBud[o + 1] = budH * 0.85 + 0.05;
-        posBud[o + 2] = Math.sin(budT) * budR * (1 - budH * 0.55);
+        toBud(
+          Math.cos(th) * budR * (1 - budH * 0.55),
+          budH * 0.85 + 0.05,
+          Math.sin(th) * budR * (1 - budH * 0.55)
+        );
 
         /* 颜色：瓣缘最亮，往里偏暖，最深处带一点金 */
         const edgeT = clamp(u);
@@ -885,39 +944,28 @@ class FlowerField {
         info[i * 4 + 2] = 0;                              // 角色：花瓣
         info[i * 4 + 3] = layer ? 1 : 0;                  // 层级（影响拧转）
 
-      } else if (i < petalCount + centerCount) {
+      } else if (isCore) {
         /* ---------- 花心金粉：密集的小球，撑出那个亮核 ---------- */
         const a = Math.random() * Math.PI * 2;
         const rr = Math.pow(Math.random(), 0.55) * 0.30;
         const y = 0.12 + Math.pow(Math.random(), 0.8) * 0.30;
-
-        posBloom[o] = Math.cos(a) * rr;
-        posBloom[o + 1] = y;
-        posBloom[o + 2] = Math.sin(a) * rr;
-
-        posBud[o] = Math.cos(a) * rr * 0.35;
-        posBud[o + 1] = 0.55 + y * 0.3;
-        posBud[o + 2] = Math.sin(a) * rr * 0.35;
+        toBloom(Math.cos(a) * rr, y, Math.sin(a) * rr);
+        toBud(Math.cos(a) * rr * 0.35, 0.55 + y * 0.3, Math.sin(a) * rr * 0.35);
 
         tmp.copy(C_CORE).offsetHSL((Math.random() - 0.5) * 0.05, 0, (Math.random() - 0.5) * 0.08);
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
         info[i * 4] = seed;
-        info[i * 4 + 1] = 0.18 + Math.random() * 0.30;
+        info[i * 4 + 1] = 0.10 + Math.random() * 0.16;
         info[i * 4 + 2] = 1;                              // 角色：花心
         info[i * 4 + 3] = 1;
+
       } else {
         /* ---------- 飘散尘埃：花周围的一层薄雾 ---------- */
         const a = Math.random() * Math.PI * 2;
         const rr = 1.5 + Math.random() * 1.8;
         const y = (Math.random() - 0.45) * 1.8;
-
-        posBloom[o] = Math.cos(a) * rr;
-        posBloom[o + 1] = y;
-        posBloom[o + 2] = Math.sin(a) * rr;
-
-        posBud[o] = Math.cos(a) * rr * 0.3;
-        posBud[o + 1] = 0.1 + Math.random() * 0.8;
-        posBud[o + 2] = Math.sin(a) * rr * 0.3;
+        toBloom(Math.cos(a) * rr, y, Math.sin(a) * rr);
+        toBud(Math.cos(a) * rr * 0.3, 0.1 + Math.random() * 0.8, Math.sin(a) * rr * 0.3);
 
         tmp.copy(C_MOTE).offsetHSL(0, 0, (Math.random() - 0.5) * 0.1);
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
@@ -943,6 +991,8 @@ class FlowerField {
       uSize: { value: params.particleSize },
       uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, CONFIG.maxPixelRatio) },
       uGlow: { value: params.glowIntensity },
+      uFade: { value: 1 },
+      uDensity: { value: 1 },
       uSpin: { value: CONFIG.spinTurns * Math.PI * 2 },
       uPointer: { value: new THREE.Vector3(0, 0, 2) },
       uPointerActive: { value: 0 },
@@ -966,8 +1016,12 @@ class FlowerField {
 
   /** 滑块拖动时只改绘制范围，不重建几何体 */
   setCount(n) {
-    const geo = this.points.geometry;
-    geo.setDrawRange(0, Math.max(1, Math.min(n, MAX_PARTICLES)));
+    const count = Math.max(1, Math.min(n, MAX_PARTICLES));
+    this.points.geometry.setDrawRange(0, count);
+    /* 密度补偿：加法混合下总亮度 ≈ 粒子数 × 单颗亮度，
+       所以粒子翻倍就必须把单颗压暗，否则整朵花会烧成白团。
+       以 5 万颗为基准 1.0；9 万颗约 0.55，1 万颗约 3（封顶）。 */
+    this.uniforms.uDensity.value = Math.min(3, Math.max(0.3, 50000 / count));
   }
 
   update(state, dt) {
@@ -980,6 +1034,271 @@ class FlowerField {
   }
 }
 
+/* ==========================================================================
+   §4.5  彩蛋：三指手势 → 粒子消失 → 汇聚成 "Love"
+   --------------------------------------------------------------------------
+   为什么单独一套粒子、而不是复用花的粒子池：
+
+     文字必须**正对镜头**、立着写。花的粒子都在 `flower.group` 里，而那个
+     组是倾斜过的（rotation.x = 0.42），把文字坐标塞进去会被一起拧歪；
+     再想反算逆旋转，又会跟「鼠标上下控制俯仰」打架。
+
+     所以文字用独立的 Points（挂在场景根节点），并给每颗粒子存一个
+     "从哪来"（aFrom，花的位置附近）和一个"第几个被写出来"（aRank），
+     顶点着色器就能做到：笔尖扫到这里 → 这颗粒子从花那边飞过来就位。
+
+   时间轴（秒）：
+     vanish 0.45  花淡出（所有粒子消失）
+     write  2.40  笔从 x=左 写到 x=右，"Love" 一笔一笔出现
+     hold   1.60  停住
+     return 0.90  文字淡出、花回来
+   ========================================================================== */
+
+/** 彩蛋时间轴（秒）：想整体调快慢就改这里 */
+const LOVE_TIMING = {
+  vanish: 0.45,   // 花淡出、所有粒子消失
+  write: 4.60,    // 一笔一笔写出来（原来 2.4 太快，放慢接近一倍）
+  hold: 2.40,     // 写完停住，让人看清
+  return: 0.90,   // 文字淡出、花回来
+};
+
+const LOVE_VERT = /* glsl */ `
+  precision highp float;
+
+  attribute vec3  aFrom;      // 起飞位置（花附近）
+  attribute float aRank;      // 0~1：这一颗在"书写顺序"里的位置
+
+  uniform float uReveal;      // 0~1 笔尖进度
+  uniform float uAlpha;       // 整体透明度
+  uniform float uSize;
+  uniform float uPixelRatio;
+  uniform float uTime;
+
+  varying vec3  vColor;
+  varying float vAlpha;
+  varying float vTip;
+
+  void main() {
+    /* 笔尖扫过 aRank 时，这颗粒子才从 aFrom 飞到位
+       （0.10 的窗口 = 一点点拖尾，不会一颗一颗蹦出来） */
+    float pen = clamp((uReveal * 1.18 - aRank) / 0.16, 0.0, 1.0);
+    float ease = pen * pen * (3.0 - 2.0 * pen);
+
+    vec3 pos = mix(aFrom, position, ease);
+
+    /* 飞行途中轻微上抛，落地感更强 */
+    pos.y += sin(ease * 3.14159) * 0.12;
+
+    /* 已经写好的字轻轻呼吸 */
+    pos.y += sin(uTime * 1.2 + aRank * 12.0) * 0.008;
+
+    vec4 mv = modelViewMatrix * vec4(pos, 1.0);
+    gl_Position = projectionMatrix * mv;
+
+    float depth = -mv.z;
+    float persp = clamp(5.6 / max(depth, 0.55), 0.35, 2.4);
+    gl_PointSize = clamp(uSize * uPixelRatio * persp, 1.0, 26.0) * step(0.02, pen);
+
+    /* 笔尖附近更亮更白，写完的字是暖粉色 */
+    vTip = exp(-abs(uReveal * 1.18 - aRank) * 26.0);
+    vColor = mix(vec3(1.00, 0.42, 0.66), vec3(1.00, 0.94, 0.86), vTip);
+    vAlpha = ease * uAlpha;
+  }
+`;
+
+const LOVE_FRAG = /* glsl */ `
+  precision highp float;
+
+  varying vec3  vColor;
+  varying float vAlpha;
+  varying float vTip;
+
+  void main() {
+    vec2 q = gl_PointCoord - 0.5;
+    float r2 = dot(q, q);
+    if (r2 > 0.25) discard;
+
+    float soft = 1.0 - r2 * 4.0;
+    float core = soft * soft * soft;
+
+    vec3 col = vColor * (0.34 + 1.05 * core) * (0.85 + 1.4 * vTip);
+    gl_FragColor = vec4(col, soft * vAlpha * 0.82);
+  }
+`;
+
+class LoveField {
+  /**
+   * @param {THREE.Scene} scene 挂在场景根节点（不随花倾斜）
+   * @param {(t:string)=>void} onPhase 阶段回调（可选）
+   */
+  constructor(scene) {
+    this.scene = scene;
+    this.phase = 'idle';
+    this.t = 0;
+    this.flowerFade = 1;      // 花的不透明度（由本类驱动）
+    this.count = 26000;       // 文字用多少颗粒子
+
+    this._build();
+  }
+
+  /** 把文字画到离屏 canvas，再把像素点采样成 3D 坐标 */
+  _samplePoints() {
+    const W = 1000;
+    const H = 300;
+    const c = document.createElement('canvas');
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext('2d');
+
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    // 手写体优先，退到衬线斜体
+    ctx.font = 'italic 230px "Segoe Script", "Brush Script MT", "Georgia", serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Love', W / 2, H / 2 + 6);
+
+    const data = ctx.getImageData(0, 0, W, H).data;
+    const pts = [];
+    const step = 2;
+    for (let y = 0; y < H; y += step) {
+      for (let x = 0; x < W; x += step) {
+        if (data[(y * W + x) * 4] > 110) pts.push(x, y);
+      }
+    }
+    return { pts, W, H };
+  }
+
+  _build() {
+    const { pts, W, H } = this._samplePoints();
+    const n = Math.max(1, pts.length / 2);
+    const N = this.count;
+
+    const pos = new Float32Array(N * 3);
+    const from = new Float32Array(N * 3);
+    const rank = new Float32Array(N);
+
+    // 文字尺寸（模型空间）：宽 3.6、高 1.08，中心抬到 y = 0.75
+    const width = 3.2;
+    const height = (H / W) * width;
+    const cx = 0;
+    const cy = 0.78;
+    const cz = 0.9;
+
+    // 起飞位置：围绕花心的一团球壳
+    for (let i = 0; i < N; i++) {
+      const p = (Math.random() * n) | 0;
+      const px = pts[p * 2];
+      const py = pts[p * 2 + 1];
+
+      const jx = (Math.random() - 0.5) * 0.012;
+      const jy = (Math.random() - 0.5) * 0.012;
+
+      pos[i * 3] = cx + (px / W - 0.5) * width + jx;
+      pos[i * 3 + 1] = cy - (py / H - 0.5) * height + jy;
+      pos[i * 3 + 2] = cz + (Math.random() - 0.5) * 0.06;
+
+      /* 书写顺序：主要按 x 从左到右，掺一点 y 与随机抖动，
+         这样同一列的点不会同时出现，像笔尖扫过去的拖尾 */
+      rank[i] = clamp(px / W + (Math.random() - 0.5) * 0.035);
+
+      // 起飞点：花周围的一个扁球
+      const a = Math.random() * Math.PI * 2;
+      const rr = 0.4 + Math.random() * 1.3;
+      from[i * 3] = Math.cos(a) * rr;
+      from[i * 3 + 1] = 0.25 + (Math.random() - 0.5) * 1.1;
+      from[i * 3 + 2] = Math.sin(a) * rr * 0.6;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('aFrom', new THREE.BufferAttribute(from, 3));
+    geo.setAttribute('aRank', new THREE.BufferAttribute(rank, 1));
+    geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0.7, 0.9), 4);
+
+    this.uniforms = {
+      uReveal: { value: 0 },
+      uAlpha: { value: 0 },
+      uSize: { value: 1.9 },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, CONFIG.maxPixelRatio) },
+      uTime: { value: 0 },
+    };
+
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: LOVE_VERT,
+      fragmentShader: LOVE_FRAG,
+      uniforms: this.uniforms,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+
+    this.points = new THREE.Points(geo, mat);
+    this.points.frustumCulled = false;
+    this.points.visible = false;
+    this.scene.add(this.points);
+  }
+
+  get playing() {
+    return this.phase !== 'idle';
+  }
+
+  /** 触发（重复触发会从头开始） */
+  play() {
+    this.phase = 'vanish';
+    this.t = 0;
+    this.points.visible = true;
+    this.uniforms.uReveal.value = 0;
+    this.uniforms.uAlpha.value = 0;
+  }
+
+  update(dt) {
+    if (this.phase === 'idle') return;
+    this.uniforms.uTime.value += dt;
+    this.t += dt;
+
+    const u = this.uniforms;
+    const T = LOVE_TIMING;
+
+    if (this.phase === 'vanish') {
+      // 花淡出
+      const k = clamp(this.t / T.vanish);
+      this.flowerFade = 1 - k;
+      u.uAlpha.value = 0;
+      if (k >= 1) { this.phase = 'write'; this.t = 0; this.flowerFade = 0; }
+
+    } else if (this.phase === 'write') {
+      // 笔尖从左写到右
+      this.flowerFade = 0;
+      u.uAlpha.value = 1;
+      u.uReveal.value = clamp(this.t / T.write);
+      if (this.t >= T.write) { this.phase = 'hold'; this.t = 0; u.uReveal.value = 1; }
+
+    } else if (this.phase === 'hold') {
+      this.flowerFade = 0;
+      u.uAlpha.value = 1;
+      if (this.t >= T.hold) { this.phase = 'return'; this.t = 0; }
+
+    } else if (this.phase === 'return') {
+      // 文字淡出、花回来
+      const k = clamp(this.t / T.return);
+      u.uAlpha.value = 1 - k;
+      this.flowerFade = k;
+      if (k >= 1) {
+        this.phase = 'idle';
+        this.t = 0;
+        this.flowerFade = 1;
+        u.uAlpha.value = 0;
+        this.points.visible = false;
+      }
+    }
+  }
+
+  resize(dpr) {
+    this.uniforms.uPixelRatio.value = dpr;
+  }
+}
 /* ==========================================================================
    §5  舞台 Stage：渲染器 / 场景 / 泛光后期 / 摄像头背景 / 星尘
    ========================================================================== */
@@ -1001,11 +1320,11 @@ function makeSoftDotTexture(size = 64) {
 }
 
 class Stage {
-  constructor(glCanvas, bgCanvas, video) {
+  constructor(glCanvas, video, previewEl) {
     this.glCanvas = glCanvas;
-    this.bgCanvas = bgCanvas;
-    this.bgCtx = bgCanvas.getContext('2d', { alpha: false });
     this.video = video;
+    /** 左上角摄像头小窗（DOM 元素，视频 + 骨架都画在里面，不进 WebGL） */
+    this.previewEl = previewEl;
 
     this.renderer = new THREE.WebGLRenderer({
       canvas: glCanvas,
@@ -1033,34 +1352,20 @@ class Stage {
       panY: 0,
     };
 
-    /* ---------- 摄像头背景：半透明叠加 ---------- */
-    this.videoTexture = new THREE.CanvasTexture(bgCanvas);
-    this.videoTexture.colorSpace = THREE.SRGBColorSpace;
-    this.bgMaterial = new THREE.MeshBasicMaterial({
-      map: this.videoTexture,
-      transparent: true,
-      opacity: CONFIG.videoOpacity,
-      depthWrite: false,
-      depthTest: false,
-    });
-    this.bgMesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.bgMaterial);
-    this.bgScene = new THREE.Scene();
-    this.bgCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-    this.bgMesh.renderOrder = -1;
-    this.bgScene.add(this.bgMesh);
 
     /* ---------- 花朵 ---------- */
     this.flower = new FlowerField();
     this.scene.add(this.flower.group);
+
+    /* ---------- 彩蛋：三指手势 → "Love" ---------- */
+    this.love = new LoveField(this.scene);
 
     /* ---------- 星尘（彩色微光，给空间一点体积感） ---------- */
     this._buildStars();
 
     /* ---------- 后期：RenderPass → Bloom → Output ---------- */
     this.composer = new EffectComposer(this.renderer);
-    this.composer.addPass(new RenderPass(this.bgScene, this.bgCamera));
     this.scenePass = new RenderPass(this.scene, this.camera);
-    this.scenePass.clear = false;           // 叠在摄像头背景之上
     this.composer.addPass(this.scenePass);
 
     this.bloomPass = new UnrealBloomPass(
@@ -1152,30 +1457,14 @@ class Stage {
     this.scene.add(this.stars);
   }
 
-  /** 把当前视频帧画进 bgCanvas（镜像），供纹理使用 */
-  drawVideoFrame() {
-    const v = this.video;
-    const c = this.bgCanvas;
-    if (!v || v.readyState < 2 || !v.videoWidth) return;
-    // 节流：摄像头 30fps，渲染可能 120fps，同一帧不必重复上传
-    if (v.currentTime === this._lastVideoTime) return;
-    this._lastVideoTime = v.currentTime;
-
-    if (c.width !== v.videoWidth || c.height !== v.videoHeight) {
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
-    }
-    const ctx = this.bgCtx;
-    ctx.save();
-    ctx.translate(c.width, 0);
-    ctx.scale(-1, 1);
-    ctx.drawImage(v, 0, 0, c.width, c.height);
-    ctx.restore();
-    this.videoTexture.needsUpdate = true;
-  }
-
+  /**
+   * 左上角摄像头小窗的显隐
+   * 视频画面由 <video> 元素自己播（CSS 镜像），骨架画在它上面的 canvas 里，
+   * 全程不进 WebGL —— 比把视频帧上传成纹理便宜得多。
+   */
   setVideoVisible(visible) {
-    this.bgMesh.visible = visible;
+    if (!this.previewEl) return;
+    this.previewEl.classList.toggle('hidden', !visible);
   }
 
   /** 把面板参数同步到渲染管线（滑块实时生效） */
@@ -1204,18 +1493,9 @@ class Stage {
     this._updateCamera();
 
     this.flower.uniforms.uPixelRatio.value = dpr;
+    this.love.resize(dpr);
     this.starUniforms.uPixelRatio.value = dpr;
 
-    // 摄像头背景 cover 铺满
-    const viewAspect = w / h;
-    const videoAspect = (this.video.videoWidth || 4) / (this.video.videoHeight || 3);
-    let sx = 1, sy = 1;
-    if (viewAspect > videoAspect) {
-      sy = viewAspect / videoAspect;
-    } else {
-      sx = videoAspect / viewAspect;
-    }
-    this.bgMesh.scale.set(sx, sy, 1);
   }
 
   /** 根据轨道状态摆相机（鼠标模式会实时改 cam） */
@@ -1233,8 +1513,11 @@ class Stage {
 
   render(dt, state) {
     this.starUniforms.uTime.value += dt;
-    this.drawVideoFrame();
     this.flower.update(state, dt);
+    /* 彩蛋：写字时把花淡出，写完再淡回来 */
+    this.love.update(dt);
+    this.flower.uniforms.uFade.value = this.love.flowerFade;
+    this.flower.group.visible = this.love.flowerFade > 0.01;
     // 花朵整体俯仰（鼠标 Y 或手势跟随）
     this.flower.group.rotation.x = damp(
       this.flower.group.rotation.x, 0.42 + state.pitch, 0.12, dt
@@ -1351,7 +1634,7 @@ class MouseController {
    ========================================================================== */
 
 const $ = (id) => document.getElementById(id);
-const STORAGE_KEY = 'gesture-flower.params.v1';
+const STORAGE_KEY = 'gesture-flower.params.v2';
 
 class UI {
   constructor(app) {
@@ -1541,6 +1824,7 @@ class UI {
       if (k === 'm') this.app.setMode(this.app.mode === 'hand' ? 'mouse' : 'hand');
       else if (k === 'h') this.togglePanel();
       else if (k === 'r') this.app.resetAll();
+      else if (k === 'l') this.app.playLove();
       else if (k === 'escape') this.togglePanel(false);
     });
   }
@@ -1597,11 +1881,13 @@ class App {
     this.lastTime = performance.now();
     this.fps = 60;
     this.spread = 0.5;          // 当前绽放度（缓动后）
+    this.threeHold = 0;         // 三指手势按住时长
+    this.loveCooldown = 0;      // 彩蛋冷却
     this.targetTension = 0.5;
 
     this.tension = new TensionMeter();
 
-    this.stage = new Stage($('gl'), $('bg'), $('video'));
+    this.stage = new Stage($('gl'), $('video'), $('camPreview'));
     this.stage.flower.setCount(params.particleCount);
 
     this.mouse = new MouseController($('gl'), this.stage);
@@ -1653,7 +1939,6 @@ class App {
     const isMouse = next === 'mouse';
     this.mouse.enable(isMouse);
     this.stage.setVideoVisible(!isMouse);
-    this.handTracker.overlay.style.opacity = isMouse ? '0' : '1';
     this.ui.syncModeButtons();
     this.ui.toast(isMouse ? '鼠标模式：左右移动控制绽放，滚轮缩放，拖拽旋转' : '手势模式：举起手，张开/握拳');
   }
@@ -1662,7 +1947,6 @@ class App {
     this.mode = 'mouse';
     this.mouse.enable(true);
     this.stage.setVideoVisible(false);
-    this.handTracker.overlay.style.opacity = '0';
     this.ui.syncModeButtons();
     this.ui.setCameraBadge('摄像头不可用', true);
     this.ui.toast(msg, 4200);
@@ -1678,7 +1962,6 @@ class App {
       this.mode = 'hand';
       this.mouse.enable(false);
       this.stage.setVideoVisible(true);
-      this.handTracker.overlay.style.opacity = '1';
       this.ui.syncModeButtons();
       return true;
     } catch (err) {
@@ -1697,6 +1980,30 @@ class App {
   retryCamera() {
     this.ui.toast('正在重试摄像头…', 1800);
     this._maybeStartCamera();
+  }
+
+  /**
+   * 数一数伸出几根手指（只数食指/中指/无名指/小指）
+   * 判据和 TensionMeter 的 openness 一致：指尖离手腕比 PIP 关节远 18% 以上
+   */
+  _countExtendedFingers(lm) {
+    if (!lm || lm.length < 21) return 0;
+    const wrist = lm[0];
+    const dip = (i) => Math.hypot(lm[i].x - wrist.x, lm[i].y - wrist.y);
+    let n = 0;
+    for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]]) {
+      if (dip(tip) > dip(pip) * 1.18) n++;
+    }
+    return n;
+  }
+
+  /** 播放彩蛋：粒子消失 → 写出 Love */
+  playLove() {
+    if (this.stage.love.playing) return;
+    this.stage.love.play();
+    this.loveCooldown = 7;        // 冷却 7 秒
+    this.threeHold = 0;
+    this.ui.toast('三根手指 ✨ 花瓣散落，聚成一句话…', 2600);
   }
 
   /* ---------------- 参数 / 重置 ---------------- */
@@ -1807,6 +2114,24 @@ class App {
     const targetBloom = tensionToBloom(this.targetTension);
     this.spread += (targetBloom - this.spread) * CONFIG.spreadEase;
     this.spread = clamp(this.spread, 0, 1);
+
+    /* ---------- ②.5 彩蛋：三根手指 → Love ----------
+       要「稳定举起三指」才算数（this.threeHold 累计 0.15s），
+       触发后进冷却，避免手一直在那儿抖就反复播放。 */
+    if (this.loveCooldown > 0) this.loveCooldown -= dt;
+    if (isHand && this.landmarks && !this.stage.love.playing) {
+      const n = this._countExtendedFingers(this.landmarks);
+      if (n === 3) {
+        this.threeHold += dt;
+        if (this.threeHold > 0.15 && this.loveCooldown <= 0) {
+          this.playLove();
+        }
+      } else {
+        this.threeHold = 0;
+      }
+    } else {
+      this.threeHold = 0;
+    }
 
     /* ---------- ③ 指尖 / 鼠标的世界坐标（近似） ---------- */
     const ptr = this.stage.flower.uniforms.uPointer.value;

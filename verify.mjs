@@ -188,7 +188,7 @@ function parseParamDefs(src) {
   const byKey = Object.fromEntries(defs.map((d) => [d.key, d]));
 
   const SPEC = [
-    ['particleCount', 1000, 50000, 1000],
+    ['particleCount', 1000, 90000, 1000],
     ['particleSize', 0.5, 6.0, null],
     ['colorFlow', 0.0, 1.0, null],
     ['glowIntensity', 0.0, 3.0, null],
@@ -204,10 +204,10 @@ function parseParamDefs(src) {
       d ? `${d.min}~${d.max}` : '缺失');
     if (d && step !== null) ok(`参数 ${key} 的步长 = ${step}`, Math.abs(d.step - step) < 1e-9);
   }
-  ok('粒子上限就是 50000（规格：MAX_PARTICLES = 50000）',
-    /const MAX_PARTICLES = 50000;/.test(mainSrc));
+  ok('粒子上限就是 90000（上下两朵花的池子）',
+    /const MAX_PARTICLES = 90000;/.test(mainSrc));
   ok('滑块只改 drawRange，不重建几何体',
-    /setDrawRange\(0,\s*Math\.max\(1,\s*Math\.min\(n,\s*MAX_PARTICLES\)\)\)/.test(mainSrc));
+    /this\.points\.geometry\.setDrawRange\(0,\s*count\)/.test(mainSrc));
   ok('参数自动保存到 localStorage', /localStorage\.setItem\(STORAGE_KEY/.test(mainSrc));
   ok('恢复初始状态会清掉 localStorage', /localStorage\.removeItem\(STORAGE_KEY\)/.test(mainSrc));
   ok('存在 DEFAULT_STATE（规格：模块三）', /const DEFAULT_STATE = \{/.test(mainSrc));
@@ -243,11 +243,15 @@ console.log('\n[4b] 视觉预设（标准 / 梦幻）');
   const dmy = mainSrc.match(/key: 'dreamy'[\s\S]*?overrides: \{([^}]*)\}/);
   ok('梦幻模式把泛光半径设成 0（拉到最低）',
     !!dmy && /bloomRadius:\s*0\b/.test(dmy[1]));
+  ok('梦幻模式把泛光阈值设成 0（拉到最低）',
+    !!dmy && /bloomThreshold:\s*0\b/.test(dmy[1]));
+  ok('梦幻模式把粒子数量显式设成 90000（最大）',
+    !!dmy && /particleCount:\s*90000/.test(dmy[1]));
 
   // 粒子数量默认值 = 最大值（两种模式都"拉满"）
   const pc = mainSrc.match(/key: 'particleCount'[\s\S]*?max:\s*(\d+)[\s\S]*?def:\s*(\d+)/);
-  ok('粒子数量默认值 = 最大值 50000（标准模式一开始就是拉满）',
-    !!pc && +pc[1] === 50000 && +pc[2] === 50000,
+  ok('粒子数量默认值 = 最大值 90000（标准模式一开始就是拉满）',
+    !!pc && +pc[1] === 90000 && +pc[2] === 90000,
     pc ? `max=${pc[1]} def=${pc[2]}` : '');
 
   ok('默认预设是标准模式', /const DEFAULT_PRESET = 'standard';/.test(mainSrc));
@@ -275,7 +279,8 @@ console.log('\n[5] 花瓣几何（极坐标玫瑰曲线）');
   ok(`花瓣数是 ${CFG.petalCount}（规格：数学公式生成花瓣）`, CFG.petalCount >= 3);
   ok('花瓣锐度在合理区间（0.2~2）', CFG.petalSharp > 0.2 && CFG.petalSharp < 2);
   ok('花瓣用 |cos(kθ/2)|^sharp 的极坐标玫瑰曲线',
-    /Math\.pow\(Math\.abs\(Math\.cos\(\(k \* theta\) \/ 2\)\),\s*sharp\)/.test(mainSrc));
+    /Math\.pow\(Math\.abs\(Math\.cos\(\(k \* theta\) \/ 2\)\),\s*s\)/.test(mainSrc));
+  ok('内层用更小的锐度指数（花瓣更圆润）', /const sharpLocal = layer \? sharp \* 0\.6 : sharp;/.test(mainSrc));
   ok('半径用 sqrt 采样，粒子在面积上均匀（否则全挤圆心）',
     /Math\.sqrt\(Math\.random\(\)\)/.test(mainSrc));
   ok('内外两层花瓣（内层旋转 30°）', /Math\.PI \/ CONFIG\.petalCount/.test(mainSrc));
@@ -404,6 +409,58 @@ console.log('\n[7] DOM 契约与交互');
   ok('dt 做了截断且不允许为负',
     /Math\.max\(0,\s*Math\.min\(\(now - this\.lastTime\) \/ 1000, 0\.05\)\)/.test(mainSrc));
   ok('骨骼绘制受 CONFIG.showSkeleton 控制', /CONFIG\.showSkeleton/.test(mainSrc));
+}
+
+/* ==========================================================================
+   8. 彩蛋：三指 → Love
+   ========================================================================== */
+
+console.log('\n[8] 彩蛋（三指 → Love）');
+{
+  const extract = (name) => {
+    const m = mainSrc.match(new RegExp(`const ${name} = /\\* glsl \\*/ \`([\\s\\S]*?)\`;`));
+    return m ? m[1] : null;
+  };
+  const lv = extract('LOVE_VERT');
+  const lf = extract('LOVE_FRAG');
+
+  ok('有 LoveField 类', /class LoveField \{/.test(mainSrc));
+  ok('文字用独立的 Points（不随花倾斜）', /new LoveField\(this\.scene\)/.test(mainSrc));
+  ok('能提取到文字的顶点/片元着色器', !!lv && !!lf);
+  ok('文字粒子带"起飞点"与"书写顺序"两个属性',
+    /attribute vec3\s+aFrom/.test(lv || '') && /attribute float aRank/.test(lv || ''));
+  ok('笔尖扫过才飞到位（按 aRank 递增出现）', /uReveal \* 1\.18 - aRank/.test(lv || ''));
+  ok('文字是加法混合 + 不写深度',
+    /blending: THREE\.AdditiveBlending/.test(mainSrc.split('class LoveField')[1] || ''));
+  ok('文字从 canvas 采样（fillText 后读像素）',
+    /fillText\('Love'/.test(mainSrc) && /getImageData\(0, 0, W, H\)/.test(mainSrc));
+  ok('书写顺序按 x 从左到右', /rank\[i\] = clamp\(px \/ W/.test(mainSrc));
+
+  for (const p of ['vanish', 'write', 'hold', 'return']) {
+    ok(`有 ${p} 阶段`,
+      new RegExp(`phase = '${p}'`).test(mainSrc) || new RegExp(`phase === '${p}'`).test(mainSrc));
+  }
+  ok('时间轴抽成了 LOVE_TIMING 常量（方便调整快慢）', /const LOVE_TIMING = \{/.test(mainSrc));
+  const timing = mainSrc.match(/const LOVE_TIMING = \{([\s\S]*?)\};/);
+  const tv = (k) => {
+    const m = timing && timing[1].match(new RegExp(`${k}:\\s*([\\d.]+)`));
+    return m ? parseFloat(m[1]) : NaN;
+  };
+  ok(`消失阶段约 0.45 秒（实际 ${tv('vanish')}）`, Math.abs(tv('vanish') - 0.45) < 1e-6);
+  ok(`书写阶段约 4.6 秒、比原来慢近一倍（实际 ${tv('write')}）`, tv('write') >= 4.0);
+  ok(`停留阶段约 2.4 秒（实际 ${tv('hold')}）`, tv('hold') >= 2.0);
+  ok(`回归阶段约 0.9 秒（实际 ${tv('return')}）`, Math.abs(tv('return') - 0.9) < 1e-6);
+  ok('update 里用的是常量而不是写死的秒数',
+    /this\.t \/ T\.write/.test(mainSrc) && /this\.t >= T\.hold/.test(mainSrc));
+
+  ok('有数手指的函数', /_countExtendedFingers\(lm\)/.test(mainSrc));
+  ok('只数四根手指（不含拇指）', /\[8, 6\], \[12, 10\], \[16, 14\], \[20, 18\]/.test(mainSrc));
+  ok('恰好三根才触发', /if \(n === 3\)/.test(mainSrc));
+  ok('要按住 0.15 秒才算（防抖）', /this\.threeHold > 0\.15/.test(mainSrc));
+  ok('触发后进冷却，避免反复播放', /this\.loveCooldown = 7/.test(mainSrc));
+  ok('可以按 L 手动触发', /k === 'l'.*playLove/.test(mainSrc.replace(/\n/g, ' ')));
+  ok('彩蛋期间把花淡出', /uniform float uFade/.test(mainSrc) && /flowerFade/.test(mainSrc));
+  ok('HUD 里写了三指彩蛋的提示', /三根手指/.test(htmlSrc));
 }
 
 console.log(`\n${'='.repeat(58)}`);

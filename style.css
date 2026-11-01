@@ -28,32 +28,68 @@ html, body {
   user-select: none;
 }
 
-#gl, #bg, #overlay {
+#gl {
   position: fixed;
   inset: 0;
   width: 100%;
   height: 100%;
   display: block;
+  z-index: 3;
 }
 
-#gl { z-index: 3; }
-#bg { z-index: 1; }
-#overlay { z-index: 2; transition: opacity 0.35s ease; pointer-events: none; }
-
-#video {
+/* ---------------- 左上角摄像头小窗 ---------------- */
+.cam-preview {
   position: fixed;
-  width: 1px;
-  height: 1px;
+  left: 18px;
+  top: 18px;
+  z-index: 12;
+  width: 224px;
+  height: 168px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(160, 180, 255, 0.28);
+  background: #05070e;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 122, 198, 0.12) inset;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+.cam-preview.hidden {
   opacity: 0;
+  transform: translateY(-8px) scale(0.96);
   pointer-events: none;
-  left: -10px;
-  top: -10px;
+}
+#video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);          /* 镜像，和骨架对齐 */
+  background: #05070e;
+}
+#overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  pointer-events: none;
+}
+.cam-tag {
+  position: absolute;
+  left: 8px;
+  bottom: 7px;
+  z-index: 3;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: rgba(226, 232, 255, 0.72);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
 }
 
 /* ---------------- 标题 ---------------- */
 .title-card {
   position: fixed;
-  left: 22px;
+  left: 256px;
   top: 18px;
   z-index: 10;
   padding: 10px 16px;
@@ -79,6 +115,9 @@ html, body {
   color: var(--ink-dim);
   letter-spacing: 0.04em;
 }
+
+/* 小窗隐藏（鼠标模式）时，标题回贴左侧，不留一块空白 */
+body:has(.cam-preview.hidden) .title-card { left: 22px; }
 
 /* ---------------- 右上角控件 ---------------- */
 .top-actions {
@@ -397,7 +436,8 @@ input[type="range"]::-moz-range-thumb {
 }
 
 @media (max-width: 640px) {
-  .title-card { left: 12px; top: 12px; padding: 8px 12px; }
+  .cam-preview { left: 12px; top: 12px; width: 148px; height: 111px; }
+  .title-card { left: 172px; top: 12px; padding: 8px 12px; }
   .title-card h1 { font-size: 15px; }
   .top-actions { right: 12px; top: 12px; gap: 6px; }
   .ghost-btn { display: none; }
