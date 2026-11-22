@@ -2198,6 +2198,7 @@ class UI {
       else if (k === 'h') this.togglePanel();
       else if (k === 'r') this.app.resetAll();
       else if (k === 'l') this.app.playLove();
+      else if (k === 'v') this.app.toggleHeart();
       else if (k === 'escape') this.togglePanel(false);
     });
   }
@@ -2263,6 +2264,7 @@ class App {
     this.heartTarget = 0;
     this.heartHold = 0;         // 保持两指的时长
     this.heartFree = 0;         // 松开两指的时长
+    this.manualHeart = false;   // 鼠标模式手动点亮的爱心（按钮 / 键盘 V）
     this.targetTension = 0.5;
 
     this.tension = new TensionMeter();
@@ -2400,6 +2402,19 @@ class App {
     this.ui.toast('三根手指 ✨ 花瓣散落，聚成一句话…', 2600);
   }
 
+  /** 手动爱心：鼠标模式点按钮 / 按 V 键，再按一次收回。
+      摄像头不可用时这就是唯一入口，所以不依赖任何手势状态。 */
+  toggleHeart(force) {
+    this.manualHeart = force ?? !this.manualHeart;
+    this.heartHold = 0;
+    this.heartFree = 0;
+    if (this.manualHeart) {
+      this.ui.toast('爱心模式 ❤ 9 万颗粒子正在聚成一颗心…（再按 [V] 收回）', 2600);
+    } else {
+      this.ui.toast('粒子散开，花朵回来了', 1800);
+    }
+  }
+
   /* ---------------- 参数 / 重置 ---------------- */
 
   onParamChange(key, value) {
@@ -2450,7 +2465,8 @@ class App {
     this.mouse.pitch = 0;
     this.targetTension = DEFAULT_STATE.tension;
 
-    // ③.5 化形状态清空（若当时正比着两根手指）
+    // ③.5 化形状态清空（若当时正比着两根手指，或手动点亮过爱心）
+    this.manualHeart = false;
     this.heart = 0;
     this.heartTarget = 0;
     this.heartHold = 0;
@@ -2571,7 +2587,13 @@ class App {
     /* ---------- ②.6 两指 V → 粒子聚成爱心 ----------
        要「稳定比出 V」才算数（this.heartHold 累计 0.22s），也是要松开一会儿
        才还原（this.heartFree），否则手指微抖就会在花和心之间来回跳。 */
-    if (isHand && this.landmarks && !this.stage.love.playing) {
+    if (this.manualHeart) {
+      // 手动爱心（右上角按钮 / 键盘 V）：绕过手势判据，直接钉住目标，
+      // 摄像头不可用时也能一键看爱心
+      this.heartTarget = 1;
+      this.heartHold = 0;
+      this.heartFree = 0;
+    } else if (isHand && this.landmarks && !this.stage.love.playing) {
       if (this._isTwoFingerV(this.landmarks)) {
         this.heartHold += dt;
         this.heartFree = 0;

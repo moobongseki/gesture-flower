@@ -185,6 +185,8 @@ body:has(.cam-preview.hidden) .title-card { left: 22px; }
 .icon-btn { width: 36px; display: grid; place-items: center; }
 .ghost-btn:hover, .icon-btn:hover { color: var(--ink); border-color: rgba(255, 122, 198, 0.5); }
 
+
+
 /* ---------------- 参数面板 ---------------- */
 .panel {
   position: fixed;
