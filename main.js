@@ -226,6 +226,7 @@ const CONFIG = {
   /* ---------- 摄像头 ---------- */
   camWidth: 640,
   camHeight: 480,
+  cameraTimeout: 9000,     // getUserMedia 最多等多久（权限弹窗没人点时不会报错，只会一直 pending）
   maxHands: 1,
   minDetectionConfidence: 0.6,
   minTrackingConfidence: 0.6,
@@ -285,6 +286,19 @@ function damp(current, target, alpha, dt) {
   if (!Number.isFinite(current) || !Number.isFinite(target)) return target;
   const keep = Math.pow(1 - clamp(alpha, 0.0001, 0.9999), dt * 60);
   return current + (target - current) * (1 - clamp(keep, 0, 1));
+}
+
+/**
+ * 给 Promise 加超时。
+ * getUserMedia 在「权限弹窗弹出来但没人点」时会一直 pending —— 既不报错也不 resolve，
+ * 页面就永远卡在"正在请求摄像头权限…"，用户看到的就是"手势模式用不了"。
+ */
+function withTimeout(promise, ms, message) {
+  let timer = 0;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /**
@@ -460,14 +474,19 @@ class HandTracker {
     // ---- ② 打开摄像头 ----
     this.onStatus('正在请求摄像头权限…');
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: 'user',
-          width: { ideal: CONFIG.camWidth },
-          height: { ideal: CONFIG.camHeight },
-        },
-      });
+      this.stream = await withTimeout(
+        navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: 'user',
+            width: { ideal: CONFIG.camWidth },
+            height: { ideal: CONFIG.camHeight },
+          },
+        }),
+        CONFIG.cameraTimeout,
+        '摄像头没有响应：浏览器的权限弹窗可能被别的窗口挡住了，或者一直没有点「允许」。' +
+        '点地址栏左侧的摄像头图标允许访问后，按右上角「重试摄像头」。'
+      );
     } catch (err) {
       throw new Error(this._describeCameraError(err));
     }
@@ -2245,6 +2264,18 @@ class UI {
     if (this.el.hdUnavailable) this.el.hdUnavailable.hidden = !warn;
   }
 
+  /** 鼠标悬停徽标就能看到完整报错原因 */
+  setCameraBadgeDetail(text) {
+    if (this.el.camBadge) this.el.camBadge.title = text || '';
+  }
+
+  /** 左下角常驻一行"摄像头不可用：<真实原因>"，别再让用户猜 */
+  showCameraHint(text) {
+    if (!this.el.hdUnavailable) return;
+    this.el.hdUnavailable.hidden = false;
+    this.el.hdUnavailable.textContent = '摄像头不可用：' + text;
+  }
+
   toast(msg, ms = 3600) {
     const t = this.el.toast;
     t.textContent = msg;
@@ -2288,6 +2319,8 @@ class App {
     this.heartHold = 0;         // 保持两指的时长
     this.heartFree = 0;         // 松开两指的时长
     this.manualHeart = false;   // 鼠标模式手动点亮的爱心（按钮 / 键盘 V）
+    this._lastCamError = '';    // 上一次摄像头失败的真实原因（回退提示要用）
+    this._camStarting = false;
     this.targetTension = 0.5;
 
     this.tension = new TensionMeter();
@@ -2362,6 +2395,8 @@ class App {
   /* ---------------- 摄像头 ---------------- */
 
   async _startCamera() {
+    if (this._camStarting) return false;      // 连点「手势模式」不重复请求设备
+    this._camStarting = true;
     try {
       this.ui.setCameraBadge('正在连接摄像头…', false);
       await this.handTracker.start();
@@ -2373,15 +2408,25 @@ class App {
       return true;
     } catch (err) {
       console.warn('[camera]', err);
+      this._lastCamError = String(err.message || err);
       this.ui.setCameraBadge('摄像头不可用', true);
-      this.ui.toast(String(err.message || err), 6000);
+      this.ui.setCameraBadgeDetail(this._lastCamError);
+      this.ui.showCameraHint(this._lastCamError);
       return false;
+    } finally {
+      this._camStarting = false;
     }
   }
 
   async _maybeStartCamera() {
     const ok = await this._startCamera();
-    if (!ok) this._fallbackToMouse('未拿到摄像头权限，已进入鼠标模式（按 M 可重试手势模式）');
+    if (!ok) {
+      /* 回退提示必须带上真实原因，否则用户只看到"摄像头不可用"，
+         会以为是不支持/没权限，实际往往是被别的程序占了设备。 */
+      this._fallbackToMouse(this._lastCamError
+        ? `摄像头不可用，已进入鼠标模式。原因：${this._lastCamError}`
+        : '未拿到摄像头权限，已进入鼠标模式（按 M 可重试手势模式）');
+    }
   }
 
   retryCamera() {
