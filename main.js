@@ -244,6 +244,13 @@ const CONFIG = {
   handScale: 0.9,          // 花朵随手掌大小的缩放强度（0 = 固定大小）
   palmSpanRef: 0.185,      // 手掌尺度基准（腕→中指根，画面归一化）
   followZ: 0.0,            // 跟随平面（花朵所在的世界 z）
+
+  /* ---------- 爱心形态（两指 V 手势） ---------- */
+  heartScale: 0.82,        // 爱心的整体大小
+  heartLift: 0.42,         // 爱心中心的高度（立在花心上方）
+  heartEase: 0.10,         // 化形/还原的缓动
+  heartHold: 0.22,         // 两指保持多久才开始化形（防抖）
+  heartRelease: 0.35,      // 松手多久才还原（防止抖动来回跳）
 };
 
 const STATE = { BUD: 'bud', MID: 'mid', BLOOM: 'bloom' };
@@ -859,7 +866,10 @@ const FLOWER_VERT = /* glsl */ `
     float role = aInfo.z;
     float b = clamp(uBloom, 0.0, 1.0);
 
-    /* ---------- ① 花苞 ↔ 绽放 ---------- */
+    /* ---------- ① 花苞 ↔ 绽放 → 爱心 ----------
+       position 这个属性由 CPU 负责在"花朵坐标"与"爱心坐标"之间插值
+       （见 FlowerField.update：化形进度写进顶点缓冲，9 万颗粒子错峰被吸过去），
+       所以这里只管花苞 ↔ 当前形态。 */
     vec3 pos = mix(aPosBud, position, b);
 
     /* 绽放时整朵花"拧"一下：花瓣一边张开一边旋转 */
@@ -892,14 +902,15 @@ const FLOWER_VERT = /* glsl */ `
     float persp = clamp(5.6 / max(depth, 0.55), 0.35, 2.4);
     float sizeK = 0.55 + aInfo.y;
     /* 花苞期只让一部分粒子可见（30% → 100%）：苞体的粒子名义上摊在整片
-       花瓣上，收拢后挤在同一个小体积里，加法混合必然烧成一根白棒。 */
+       花瓣上，收拢后挤在同一个小体积里，加法混合必然烧成一根白棒。
+       化形成爱心时体量够大，放开到 85% 才够饱满。 */
     float keep = 0.30 + 0.70 * b;
     float vis = step(seed, keep);
     gl_PointSize = clamp(uSize * sizeK * uPixelRatio * persp, 1.0, 48.0) * vis;
     if (depth < 0.6) gl_PointSize = 0.0;
 
     /* ---------- ⑤ 颜色 ---------- */
-    /* 花苞期整体偏玫红、偏暗；绽放后回到花瓣本色 */
+    /* 花苞期整体偏玫红、偏暗；绽放后回到花瓣本色；爱心则整体推向玫瑰红 */
     vec3 budCol = mix(aColor, vec3(0.62, 0.13, 0.30), 0.45) * 0.92;
     vec3 col = mix(budCol, aColor, b);
 
@@ -984,6 +995,7 @@ class FlowerField {
     const N = MAX_PARTICLES;
     const posBloom = new Float32Array(N * 3);
     const posBud = new Float32Array(N * 3);
+    const posHeart = new Float32Array(N * 3);
     const colors = new Float32Array(N * 3);
     const info = new Float32Array(N * 4);
 
@@ -1007,6 +1019,93 @@ class FlowerField {
     const k = CONFIG.petalCount;
     const sharp = CONFIG.petalSharp;
     const tmp = new THREE.Color();
+
+    /* ---------- 爱心目标点池（两指 V 时粒子聚成的心） ----------
+       用经典参数心形曲线
+           x = 16 sin³t
+           y = 13cos t − 5cos2t − 2cos3t − cos4t
+       它的轮廓"上双瓣、下尖角"最标准，比隐函数 (x²+y²−1)³=x²y³ 那种
+       圆屁股的坨子更像一颗心。
+       填充方式：先把曲线扫线栅格化成占用网格，再按格子面积均匀取点。
+       （不用"从中心放射缩放"那套：心形的矢量和尖角都在中轴线上，
+       放射采样会在正中堆出一条又直又亮的脊，看着像被人从中间剖开。）
+       34% 的点取贴边格子，心形的边才立得住；z 按离中心的距离收一个透镜厚度。
+       预采 6000 点做池，9 万颗粒子各取一个 + 抖动，省掉 9 万次计算。 */
+    const HEART_POOL = (() => {
+      const raw = (t) => [
+        16 * Math.sin(t) ** 3,
+        13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t),
+      ];
+      let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
+      const STEPS = 192;
+      const curve = [];
+      for (let i = 0; i < STEPS; i++) {
+        const [x, y] = raw((i / STEPS) * Math.PI * 2);
+        curve.push([x, y]);
+        mnx = Math.min(mnx, x); mxx = Math.max(mxx, x);
+        mny = Math.min(mny, y); mxy = Math.max(mxy, y);
+      }
+      const ccx = (mnx + mxx) / 2;
+      const ccy = (mny + mxy) / 2;
+      const sx = 2 / (mxx - mnx);        // 归一化到 x ∈ [-1, 1]
+      const sy = sx * 1.12;              // 纵向略拉长，心形更精神
+      const poly = curve.map(([x, y]) => [(x - ccx) * sx, (y - ccy) * sy]);
+      let bx0 = Infinity, bx1 = -Infinity, by0 = Infinity, by1 = -Infinity;
+      for (const [x, y] of poly) {
+        bx0 = Math.min(bx0, x); bx1 = Math.max(bx1, x);
+        by0 = Math.min(by0, y); by1 = Math.max(by1, y);
+      }
+
+      /* 扫线填充 → 占用网格 */
+      const G = 132;
+      const grid = new Uint8Array(G * G);
+      const xs = [];
+      for (let gy = 0; gy < G; gy++) {
+        const y = by0 + (gy + 0.5) / G * (by1 - by0);
+        xs.length = 0;
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          const [xi, yi] = poly[i], [xj, yj] = poly[j];
+          if ((yi > y) !== (yj > y)) xs.push((xj - xi) * (y - yi) / (yj - yi) + xi);
+        }
+        xs.sort((a, b) => a - b);
+        for (let k = 0; k + 1 < xs.length; k += 2) {
+          const gx0 = Math.max(0, Math.ceil((xs[k] - bx0) / (bx1 - bx0) * G - 0.5));
+          const gx1 = Math.min(G - 1, Math.floor((xs[k + 1] - bx0) / (bx1 - bx0) * G - 0.5));
+          for (let gx = gx0; gx <= gx1; gx++) grid[gy * G + gx] = 1;
+        }
+      }
+
+      /* 内部格子 + 贴边格子 */
+      const inner = [];
+      const edge = [];
+      for (let gy = 0; gy < G; gy++) {
+        for (let gx = 0; gx < G; gx++) {
+          if (!grid[gy * G + gx]) continue;
+          inner.push(gy * G + gx);
+          const up = gy + 1 < G ? grid[(gy + 1) * G + gx] : 0;
+          const dn = gy - 1 >= 0 ? grid[(gy - 1) * G + gx] : 0;
+          const lf = gx - 1 >= 0 ? grid[gy * G + gx - 1] : 0;
+          const rt = gx + 1 < G ? grid[gy * G + gx + 1] : 0;
+          if (!(up && dn && lf && rt)) edge.push(gy * G + gx);
+        }
+      }
+
+      const halfY = (by0 + by1) / 2;
+      const out = [];
+      for (let i = 0; i < 6000; i++) {
+        const shell = Math.random() < 0.34;
+        const src = shell && edge.length ? edge : inner;
+        const cell = src[(Math.random() * src.length) | 0];
+        const gx = cell % G;
+        const gy = (cell - gx) / G;
+        const x = bx0 + (gx + Math.random()) / G * (bx1 - bx0);
+        const y = by0 + (gy + Math.random()) / G * (by1 - by0);
+        const r = Math.min(1, Math.hypot(x, (y - halfY) * 1.1));
+        const zmax = 0.26 * Math.sqrt(Math.max(0.02, 1 - r * r)) * (0.55 + 0.45 * Math.random());
+        out.push([x, y, (Math.random() < 0.5 ? -1 : 1) * zmax]);
+      }
+      return out;
+    })();
 
     /** 玫瑰曲线：|cos(kθ/2)|^sharp（sharp 越小瓣越圆润、越大越尖瘦） */
     const petalR = (theta, s = sharp) => Math.pow(Math.abs(Math.cos((k * theta) / 2)), s);
@@ -1040,6 +1139,19 @@ class FlowerField {
         posBud[o] = lx * F.scale + F.lean;
         posBud[o + 1] = yy * F.scale + F.cy;
         posBud[o + 2] = zz * F.scale;
+      };
+
+      /* 爱心目标：从点池里随机取一个，加一点抖动免得整颗心像贴图 */
+      const hp = HEART_POOL[(Math.random() * HEART_POOL.length) | 0];
+      const jx = (Math.random() - 0.5) * 0.024;
+      const jy = (Math.random() - 0.5) * 0.024;
+      const jz = (Math.random() - 0.5) * 0.020;
+      /** s = 相对心形的缩放（花心收在中间、尘埃散在外圈） */
+      const toHeart = (s, dy = 0) => {
+        const HS = CONFIG.heartScale * s;
+        posHeart[o] = hp[0] * HS + jx;
+        posHeart[o + 1] = hp[1] * HS + CONFIG.heartLift + dy + jy;
+        posHeart[o + 2] = hp[2] * HS + jz;
       };
 
       if (!isCore && !isMote) {
@@ -1118,6 +1230,7 @@ class FlowerField {
           yBud + (Math.random() - 0.5) * 0.02,
           Math.sin(th + tw) * rBud
         );
+        toHeart(1.0);                          // 花瓣粒子铺满整颗心
 
         /* 颜色：瓣缘最亮，往里偏暖，最深处带一点金 */
         const edgeT = clamp(u);
@@ -1141,6 +1254,7 @@ class FlowerField {
         toBloom(Math.cos(a) * rr, y, Math.sin(a) * rr);
         // 花苞里金粉藏在苞心偏下的位置，只透出一点暖光
         toBud(Math.cos(a) * rr * 0.30, 0.12 + Math.pow(Math.random(), 0.9) * 0.34, Math.sin(a) * rr * 0.30);
+        toHeart(0.45);                         // 金粉收在心的中央，撑出暖核
 
         tmp.copy(C_CORE).offsetHSL((Math.random() - 0.5) * 0.05, 0, (Math.random() - 0.5) * 0.08);
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
@@ -1157,6 +1271,7 @@ class FlowerField {
         toBloom(Math.cos(a) * rr, y, Math.sin(a) * rr);
         // 花苞期尘埃围在苞体外侧，撑出一层很薄的辉光
         toBud(Math.cos(a) * rr * 0.30, 0.10 + Math.random() * 1.30, Math.sin(a) * rr * 0.30);
+        toHeart(1.06, (Math.random() - 0.5) * 0.20);   // 尘埃绕着心飘一层薄辉光
 
         tmp.copy(C_MOTE).offsetHSL(0, 0, (Math.random() - 0.5) * 0.1);
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
@@ -1170,11 +1285,19 @@ class FlowerField {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(posBloom, 3));
     geo.setAttribute('aPosBud', new THREE.BufferAttribute(posBud, 3));
+    geo.setAttribute('aPosHeart', new THREE.BufferAttribute(posHeart, 3));
     geo.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
     geo.setAttribute('aInfo', new THREE.BufferAttribute(info, 4));
     // 只画前 particleCount 颗（滑块只改这个数字）
     geo.setDrawRange(0, Math.min(params.particleCount, N));
     geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 0.5, 0), 12);
+
+    /* 化形用的两份坐标：绽放位置（原点集）与爱心位置。
+       position 属性会被就地改写（花朵 ↔ 爱心插值），所以先把绽放坐标留一份底。 */
+    this.bloomPos = posBloom.slice();
+    this.heartPos = posHeart;
+    this.seedArr = info;          // info[4i] 是随机种子，用来给粒子错峰
+    this._heartPrev = 0;
 
     this.uniforms = {
       uBloom: { value: 0.5 },
@@ -1217,11 +1340,60 @@ class FlowerField {
 
   update(state, dt) {
     const u = this.uniforms;
-    u.uBloom.value = state.bloom;
+    const hvNow = state.heart || 0;
+    /* 化形成心时 bloom 顶到 1：position 里已经是爱心坐标，
+       再让它跟着花苞插值会把心压扁压暗。 */
+    u.uBloom.value = state.bloom + (1 - state.bloom) * hvNow;
+
+    /* ---------- 化形成心（花朵 ↔ 爱心） ----------
+       把进度直接烘进 position 顶点缓冲：9 万颗一次线性插值，
+       每颗粒子按 seed 错峰 0.16，粒子是一波一波被吸过去的。
+       只在进度真的变了时才重算/上传（静止时零开销）。
+
+       关键：着色器会对每颗粒子各转一个角度
+           ang = bloom·uSpin·(0.55+w·0.9) + seed·0.15
+       所以插值必须在"已经转过"的坐标系里做：
+       先把花朵坐标正向转 ang，与爱心点插值，再反向转回属性空间，
+       着色器那一转就正好把它还原。这样两头都精确，中间是旋转着聚拢的涡流。 */
+    const hv = hvNow;
+    const spinTot = CONFIG.spinTurns * Math.PI * 2;
+    const bCur = u.uBloom.value;
+    if (Math.abs(hv - this._heartPrev) > 0.002) {
+      this._heartPrev = hv;
+      const geo = this.points.geometry;
+      const attr = geo.getAttribute('position');
+      const A = attr.array, B = this.bloomPos, H = this.heartPos, S = this.seedArr;
+      const n = attr.count;
+      for (let i = 0; i < n; i++) {
+        const o = i * 3;
+        const ang = bCur * spinTot * (0.55 + S[i * 4 + 3] * 0.9) + S[i * 4] * 0.15;
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        // 花朵坐标在着色器空间里的样子
+        const bx = B[o] * ca + B[o + 2] * sa;
+        const bz = -B[o] * sa + B[o + 2] * ca;
+        const hi = Math.min(1, Math.max(0, (hv - S[i * 4] * 0.16) / 0.84));
+        // 混合后反旋回属性空间
+        const mx = bx + (H[o] - bx) * hi;
+        const mz = bz + (H[o + 2] - bz) * hi;
+        A[o]     = mx * ca - mz * sa;
+        A[o + 1] = B[o + 1] + (H[o + 1] - B[o + 1]) * hi;
+        A[o + 2] = mx * sa + mz * ca;
+      }
+      attr.needsUpdate = true;
+    }
     u.uTime.value += dt;
     u.uPointer.value.copy(state.pointer);
     u.uPointerActive.value = damp(u.uPointerActive.value, state.pointerActive ? 1 : 0, 0.2, dt);
-    this.group.rotation.y += dt * CONFIG.autoRotate;
+    /* 自转：绽开时慢慢转，化形成心时必须停在正对镜头 ——
+       心形一转到侧面，两颗心瓣就压成两团，看不出是心。
+       目标角取最近的 2π 整数倍，这样它只"回正"最多半圈，不会绕一大圈。 */
+    const hh = state.heart || 0;
+    if (hh > 0.002) {
+      const target = Math.round(this.group.rotation.y / (Math.PI * 2)) * Math.PI * 2;
+      this.group.rotation.y = damp(this.group.rotation.y, target, 0.10 * hh, dt);
+    } else {
+      this.group.rotation.y += dt * CONFIG.autoRotate;
+    }
   }
 }
 
@@ -1710,9 +1882,19 @@ class Stage {
     this.flower.uniforms.uFade.value = this.love.flowerFade;
     this.flower.group.visible = this.love.flowerFade > 0.01;
     // 花朵整体俯仰（鼠标 Y 或手势跟随）
+    /* 化形成心时把花"摆正"：心是平面图形，前倾 24° 加自转侧看就散成几团了 */
+    const hh = state.heart || 0;
     this.flower.group.rotation.x = damp(
-      this.flower.group.rotation.x, 0.42 + state.pitch, 0.12, dt
+      this.flower.group.rotation.x, (0.42 + state.pitch) * (1 - 0.86 * hh), 0.12, dt
     );
+    /* 化形成心时收一收泛光、点径与亮度：心形是"面"，
+       光晕一大、点一大就糊成团粉云，边和瓣都看不出来。
+       形变中途粒子被往里收，密度会临时暴涨，再给一个"中途压暗"，
+       否则整段转化就是一团白光闪过去。 */
+    const dip = 1 - 0.55 * Math.sin(Math.PI * hh);
+    this.flower.uniforms.uGlow.value = params.glowIntensity * (1 - 0.35 * hh) * dip;
+    this.flower.uniforms.uSize.value = params.particleSize * (1 - 0.24 * hh);
+    this.bloomPass.strength = params.bloomStrength * (1 - 0.5 * hh) * dip;
     this.composer.render();
   }
 }
@@ -2048,13 +2230,16 @@ class UI {
   }
 
   /** 每帧刷新 HUD（只写变化过的文本，避免布局抖动） */
-  updateHud({ tension, bloom, hasHand, fps, mode }) {
+  updateHud({ tension, bloom, heart = 0, hasHand, fps, mode }) {
     const tp = (tension * 100).toFixed(0);
     this.el.hudTension.textContent = tension.toFixed(3);
     this.el.barTension.style.width = tp + '%';
     this.el.hudBloom.textContent = bloom.toFixed(3);
     this.el.barBloom.style.width = (bloom * 100).toFixed(0) + '%';
-    this.el.hudHand.textContent = mode === 'mouse' ? '鼠标接管' : (hasHand ? '已识别' : '未识别');
+    const heartOn = heart > 0.5;
+    this.el.hudHand.textContent = mode === 'mouse'
+      ? '鼠标接管'
+      : (heartOn ? '爱心 ❤' : (hasHand ? '已识别' : '未识别'));
     this.el.hudFps.textContent = fps.toFixed(0) + ' FPS';
   }
 }
@@ -2074,6 +2259,10 @@ class App {
     this.spread = 0.5;          // 当前绽放度（缓动后）
     this.threeHold = 0;         // 三指手势按住时长
     this.loveCooldown = 0;      // 彩蛋冷却
+    this.heart = 0;             // 爱心形变度（0=花朵，1=爱心）
+    this.heartTarget = 0;
+    this.heartHold = 0;         // 保持两指的时长
+    this.heartFree = 0;         // 松开两指的时长
     this.targetTension = 0.5;
 
     this.tension = new TensionMeter();
@@ -2190,6 +2379,18 @@ class App {
     return n;
   }
 
+  /**
+   * 两根手指（V / 剪刀手）：食指、中指伸直，无名指、小指蜷起
+   * 判据与 _countExtendedFingers 一致：指尖离手腕比 PIP 关节远 18% 以上
+   */
+  _isTwoFingerV(lm) {
+    if (!lm || lm.length < 21) return false;
+    const wrist = lm[0];
+    const dip = (i) => Math.hypot(lm[i].x - wrist.x, lm[i].y - wrist.y);
+    const ext = (tip, pip) => dip(tip) > dip(pip) * 1.18;
+    return ext(8, 6) && ext(12, 10) && !ext(16, 14) && !ext(20, 18);
+  }
+
   /** 播放彩蛋：粒子消失 → 写出 Love */
   playLove() {
     if (this.stage.love.playing) return;
@@ -2248,6 +2449,13 @@ class App {
     this.mouse.tension = DEFAULT_STATE.tension;
     this.mouse.pitch = 0;
     this.targetTension = DEFAULT_STATE.tension;
+
+    // ③.5 化形状态清空（若当时正比着两根手指）
+    this.heart = 0;
+    this.heartTarget = 0;
+    this.heartHold = 0;
+    this.heartFree = 0;
+    this.threeHold = 0;
 
     // ④ 交互模式
     if (this.handTracker.running) this.setMode('hand');
@@ -2360,6 +2568,31 @@ class App {
     group.position.y = damp(group.position.y, fy, ease, dt);
     group.scale.setScalar(damp(group.scale.x, fs, ease, dt));
 
+    /* ---------- ②.6 两指 V → 粒子聚成爱心 ----------
+       要「稳定比出 V」才算数（this.heartHold 累计 0.22s），也是要松开一会儿
+       才还原（this.heartFree），否则手指微抖就会在花和心之间来回跳。 */
+    if (isHand && this.landmarks && !this.stage.love.playing) {
+      if (this._isTwoFingerV(this.landmarks)) {
+        this.heartHold += dt;
+        this.heartFree = 0;
+        if (this.heartHold >= CONFIG.heartHold && this.heartTarget !== 1) {
+          this.heartTarget = 1;
+          this.ui.toast('两根手指 ❤ 花瓣正在聚成一颗心…', 2200);
+        }
+      } else {
+        this.heartFree += dt;
+        this.heartHold = 0;
+        if (this.heartFree >= CONFIG.heartRelease) this.heartTarget = 0;
+      }
+    } else {
+      this.heartFree += dt;
+      if (this.heartFree >= CONFIG.heartRelease) {
+        this.heartTarget = 0;
+        this.heartHold = 0;
+      }
+    }
+    this.heart = damp(this.heart, this.heartTarget, CONFIG.heartEase, dt);
+
     /* ---------- ③ 指尖 / 鼠标的世界坐标 ----------
        排斥与点亮用食指指尖（8 号点）：花已经跟着掌心走了，
        若还用掌心做排斥点，就是往花心正中挖一个洞。 */
@@ -2380,6 +2613,7 @@ class App {
     /* ---------- ④ 渲染 ---------- */
     this.stage.render(dt, {
       bloom: this.spread,
+      heart: this.heart,
       pointer: ptr,
       pointerActive: this.mode === 'mouse' ? this.mouse.hasCursor : pointerActive,
       pitch: this.mode === 'mouse' ? this.mouse.pitch : (this.handTracker.pointer.y - 0.5) * 0.4,
@@ -2389,6 +2623,7 @@ class App {
     this.ui.updateHud({
       tension: isHand ? this.tension.value : this.mouse.tension,
       bloom: this.spread,
+      heart: this.heart,
       hasHand: this.tension.hasHand,
       fps: this.fps,
       mode: this.mode,
