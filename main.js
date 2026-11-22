@@ -23,6 +23,84 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 /* ==========================================================================
+   §0.5  MediaPipe tasks-vision 多源加载 + 模型下载进度
+   --------------------------------------------------------------------------
+   · 旧版 @mediapipe/hands（UMD）已废弃，迁移到 tasks-vision HandLandmarker：
+       - GPU delegate 推理更快，失败自动回退 CPU
+       - 额外输出 worldLandmarks（米制 3D 坐标），张开度计算抗手旋转
+   · 依赖按优先级依次尝试：jsDelivr → npmmirror（国内）→ unpkg
+   · 模型优先用仓库自带的本地文件（models/hand_landmarker.task），
+     下载过程带进度回调，页面遮罩实时显示百分比
+   ========================================================================== */
+
+const MP_VER = '0.10.21';
+const VISION_SOURCES = [
+  { name: 'jsdelivr',  mod: `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`,
+    wasm: `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm` },
+  { name: 'npmmirror', mod: `https://registry.npmmirror.com/@mediapipe/tasks-vision/${MP_VER}/files/vision_bundle.mjs`,
+    wasm: `https://registry.npmmirror.com/@mediapipe/tasks-vision/${MP_VER}/files/wasm` },
+  { name: 'unpkg',     mod: `https://unpkg.com/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`,
+    wasm: `https://unpkg.com/@mediapipe/tasks-vision@${MP_VER}/wasm` },
+];
+const MODEL_SOURCES = [
+  './models/hand_landmarker.task',
+  'https://cdn.jsdelivr.net/gh/tan396222-prog/gesture-bloom@main/models/hand_landmarker.task',
+  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+];
+
+/** 下载字节流，带 0~1 进度回调；校验不是被静态托管回退成的 HTML */
+async function fetchBytes(url, onProgress) {
+  const res = await fetch(url, { cache: 'force-cache' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const total = Number(res.headers.get('content-length')) || 0;
+  let bytes;
+  if (res.body && total && res.body.getReader) {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got += value.length;
+      onProgress?.(Math.min(0.99, got / total));
+    }
+    bytes = new Uint8Array(got);
+    let o = 0;
+    for (const c of chunks) { bytes.set(c, o); o += c.length; }
+  } else {
+    bytes = new Uint8Array(await res.arrayBuffer());
+  }
+  // .task 是带 2 字节前缀的 zip（PK 头）；HTML 回退页以 '<' 开头且很小
+  if (bytes.length < 100000 || bytes[0] === 0x3c) throw new Error('invalid model file');
+  onProgress?.(1);
+  return bytes;
+}
+
+/* ---- 加载进度遮罩（DOM 直接操作，避免和 UI 类互相依赖） ---- */
+const loadEl = {
+  overlay: document.getElementById('loadOverlay'),
+  label: document.getElementById('loadLabel'),
+  bar: document.getElementById('loadBar'),
+  pct: document.getElementById('loadPct'),
+};
+function showLoad(label) {
+  if (!loadEl.overlay) return;
+  loadEl.overlay.hidden = false;
+  setLoad(0, label);
+}
+function setLoad(p, label) {
+  if (!loadEl.overlay || loadEl.overlay.hidden) return;
+  const pct = Math.round(Math.min(1, Math.max(0, p)) * 100);
+  if (loadEl.bar) loadEl.bar.style.width = pct + '%';
+  if (loadEl.pct) loadEl.pct.textContent = pct + '%';
+  if (label && loadEl.label) loadEl.label.textContent = label;
+}
+function hideLoad() {
+  if (loadEl.overlay) loadEl.overlay.hidden = true;
+}
+
+/* ==========================================================================
    §0  配置与默认参数
    ========================================================================== */
 
@@ -158,6 +236,14 @@ const CONFIG = {
   autoRotate: 0.06,        // 花朵自转（弧度/秒）
   pointerRepel: 0.55,      // 指尖/鼠标附近的排斥强度
   showSkeleton: true,      // 是否绘制 21 点骨架
+
+  /* ---------- 花朵跟手（掌心悬停） ---------- */
+  handFollow: 0.78,        // 跟随强度：1 = 完全贴合掌心，0 = 固定居中
+  handLift: 0.18,          // 花朵浮在掌心上方的高度（世界单位）
+  handFollowEase: 0.09,    // 跟随缓动（越大越跟手，越小越飘）
+  handScale: 0.9,          // 花朵随手掌大小的缩放强度（0 = 固定大小）
+  palmSpanRef: 0.185,      // 手掌尺度基准（腕→中指根，画面归一化）
+  followZ: 0.0,            // 跟随平面（花朵所在的世界 z）
 };
 
 const STATE = { BUD: 'bud', MID: 'mid', BLOOM: 'bloom' };
@@ -227,13 +313,18 @@ class TensionMeter {
     this.openness = 0;
   }
 
-  update(lm, dt) {
+  update(lm, dt, world) {
     const { smoothing, gain, openGain, lowTension, highTension, lostTimeout } = CONFIG;
 
     if (lm && lm.length >= 21) {
       this.hasHand = true;
-      const wrist = lm[0];
-      const dip = (i) => Math.hypot(lm[i].x - wrist.x, lm[i].y - wrist.y, (lm[i].z - wrist.z) * 0.5);
+      /* 优先用 worldLandmarks（米制 3D，原点在手几何中心）：
+         距离比值天然尺度归一化，且手翻转/侧对摄像头时读数不塌陷。
+         没有 world 时回退到画面归一化坐标（z 是伪深度，权重减半）。 */
+      const P = (world && world.length >= 21) ? world : lm;
+      const zw = P === lm ? 0.5 : 1.0;
+      const wrist = P[0];
+      const dip = (i) => Math.hypot(P[i].x - wrist.x, P[i].y - wrist.y, (P[i].z - wrist.z) * zw);
 
       const palmScale = Math.max(dip(9), 1e-4);
       const tips = [4, 8, 12, 16, 20];
@@ -242,11 +333,11 @@ class TensionMeter {
 
       this.raw = clamp(clamp(relative * openGain, 0, 1) * gain, 0, 1);
 
-      // 辅助指标：四指伸直程度
+      // 辅助指标：四指伸直程度（同样用 3D 距离，抗旋转）
       this.openness = [8, 12, 16, 20].reduce((s, tipIdx, k) => {
         const pipIdx = [6, 10, 14, 18][k];
-        const dTip = Math.hypot(lm[tipIdx].x - wrist.x, lm[tipIdx].y - wrist.y);
-        const dPip = Math.hypot(lm[pipIdx].x - wrist.x, lm[pipIdx].y - wrist.y);
+        const dTip = dip(tipIdx);
+        const dPip = dip(pipIdx);
         return s + clamp(dTip / Math.max(dPip, 1e-4) - 1, 0, 1);
       }, 0) / 4;
 
@@ -274,7 +365,7 @@ class TensionMeter {
 /* ==========================================================================
    §2  手势追踪 HandTracker
    --------------------------------------------------------------------------
-   · 使用 MediaPipe Hands（CDN UMD，window.Hands）
+   · 使用 MediaPipe tasks-vision HandLandmarker（多源动态加载，GPU→CPU 回退）
    · 输入：隐藏的 <video>
    · 输出：onResults(landmarks|null, handedness)
    · 额外职责：在 overlay 画布上绘制 21 点与骨架连线
@@ -306,7 +397,8 @@ class HandTracker {
     this.onError = onError || (() => {});
     this.onStatus = onStatus || (() => {});
 
-    this.hands = null;
+    this.landmarker = null;
+    this.source = '';
     this.stream = null;
     this.running = false;
 
@@ -315,6 +407,7 @@ class HandTracker {
     this.handsData = [];
     /** 兼容旧接口：主手（右手优先）的 21 点，没有手时为 null */
     this.lastLandmarks = null;
+    this.lastWorldLandmarks = null;
     this.lastHandedness = null;
 
     /** 平滑后的手指位置（用于画面“跟手”），存归一化坐标 */
@@ -326,9 +419,9 @@ class HandTracker {
     this.twoHandActive = false;
   }
 
-  /** 检查 MediaPipe 脚本是否加载成功 */
+  /** tasks-vision 模块在 start() 里按需多源加载，无需预检查 UMD 脚本 */
   static isAvailable() {
-    return typeof window !== 'undefined' && typeof window.Hands === 'function';
+    return true;
   }
 
   /** 请求摄像头 + 初始化 MediaPipe。返回 Promise<void> */
@@ -342,11 +435,19 @@ class HandTracker {
         '并确认页面通过 http(s) 打开（file:// 协议下浏览器会禁用摄像头）。'
       );
     }
-    if (!HandTracker.isAvailable()) {
-      throw new Error(
-        'MediaPipe Hands 脚本未能加载（window.Hands 未定义）。' +
-        '请检查网络是否能访问 cdn.jsdelivr.net，或改用 npm 本地安装后重试。'
-      );
+    // ---- ③ 初始化 MediaPipe HandLandmarker（tasks-vision，多源 + 进度） ----
+    // 重试摄像头时复用已创建的识别器，不重复下载模型
+    if (!this.landmarker) {
+      this.onStatus('正在加载手部识别模型…');
+      showLoad('正在下载手部识别模型…');
+      try {
+        this.landmarker = await this._createLandmarker();
+      } catch (err) {
+        hideLoad();
+        throw err;
+      }
+      setLoad(1, '模型就绪');
+      hideLoad();
     }
 
     // ---- ② 打开摄像头 ----
@@ -371,71 +472,131 @@ class HandTracker {
       /* 某些浏览器 play() 会被拒绝，交给下方 videoWidth 检测兜底 */
     });
 
-    // ---- ③ 初始化 MediaPipe Hands ----
-    this.onStatus('正在初始化手部识别模型…');
-    this.hands = new window.Hands({
-      locateFile: (file) =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
-    });
-
-    this.hands.setOptions({
-      /* 始终识别 2 只手：单手模式下多识别的那只不会参与运算（见 App._frame），
-         但保留它有两个好处：
-           1. 用户可以随时切到双手模式而无需重启识别
-           2. 单手模式下也能在画面里看到第二只手，提示"切双手就能用上它"
-         代价是识别开销略高；若在低端机上有性能问题，
-         可以把 maxHands 设成 1（那样双手模式就不可用了）。 */
-      maxNumHands: CONFIG.maxHands,
-      modelComplexity: 1,             // 0=最快 / 1=平衡；移动端可考虑 0
-      selfieMode: false,              // 我们自己处理镜像，避免坐标二次翻转
-      minDetectionConfidence: CONFIG.minDetectionConfidence,
-      minTrackingConfidence: CONFIG.minTrackingConfidence,
-    });
-
-    this.hands.onResults((results) => this._handleResults(results));
-
     // ---- ④ 启动识别循环 ----
     this.running = true;
     this.onStatus('手势识别运行中');
     this._loop();
   }
 
-  /** 内部识别循环：send 是异步的，必须 await 后再排下一帧，否则会堆积 */
-  async _loop() {
-    while (this.running) {
-      if (this.video.readyState >= 2 && this.video.videoWidth > 0) {
-        try {
-          await this.hands.send({ image: this.video });
-        } catch (err) {
-          // 单帧失败不致命，记录后继续
-          console.warn('[HandTracker] send 失败：', err);
-        }
-      } else {
-        await new Promise((r) => setTimeout(r, 60));
+  /**
+   * 创建 HandLandmarker：
+   *   模型下载（0→60%，多源回退）→ 加载推理引擎（60→85%）→ 创建实例 GPU→CPU（85→100%）
+   * 识别 2 只手：单手模式下多识别的那只不参与运算，但保留它，
+   * 用户随时切双手模式无需重启识别。
+   */
+  async _createLandmarker() {
+    // ---- 模型字节（本地优先，带进度） ----
+    let modelBytes = null;
+    let lastErr = null;
+    for (const url of MODEL_SOURCES) {
+      try {
+        modelBytes = await fetchBytes(url, (p) => setLoad(p * 0.6, '正在下载手部识别模型…'));
+        break;
+      } catch (e) {
+        lastErr = e;
+        console.warn('[HandTracker] 模型源失败：', url, e.message);
+      }
+    }
+    if (!modelBytes) throw new Error('手部识别模型下载失败：' + (lastErr?.message || '所有源均不可用'));
+
+    // ---- 推理引擎 + 实例（多源 × GPU/CPU 回退） ----
+    for (const src of VISION_SOURCES) {
+      let vision;
+      setLoad(0.62, `正在加载推理引擎（${src.name}）…`);
+      try {
+        vision = await import(/* @vite-ignore */ src.mod);
+      } catch (e) {
+        console.warn('[HandTracker] vision 模块失败：', src.name);
         continue;
       }
-      // MediaPipe 会自己占用一帧时间；这里补一个微延时让出主线程
+      try {
+        setLoad(0.72, '正在初始化 WASM…');
+        const fileset = await vision.FilesetResolver.forVisionTasks(src.wasm);
+        for (const delegate of ['GPU', 'CPU']) {
+          try {
+            setLoad(0.85, `正在创建识别器（${delegate}）…`);
+            const landmarker = await vision.HandLandmarker.createFromOptions(fileset, {
+              baseOptions: { modelAssetBuffer: modelBytes, delegate },
+              runningMode: 'VIDEO',
+              numHands: Math.max(2, CONFIG.maxHands),
+              minHandDetectionConfidence: CONFIG.minDetectionConfidence,
+              minHandPresenceConfidence: 0.5,
+              minTrackingConfidence: CONFIG.minTrackingConfidence,
+            });
+            this.source = `${src.name}/${delegate}`;
+            console.info('[HandTracker] 识别器就绪：', this.source);
+            setLoad(0.98, '识别器就绪');
+            return landmarker;
+          } catch (e) {
+            console.warn('[HandTracker] delegate 失败：', delegate, e?.message);
+          }
+        }
+      } catch (e) {
+        console.warn('[HandTracker] wasm 失败：', src.name, e?.message);
+      }
+    }
+    throw new Error('HandLandmarker 初始化失败：请检查网络后重试');
+  }
+
+  /**
+   * 内部识别循环：detectForVideo 是同步调用（GPU 读回），
+   * 按视频帧去重 + 检测耗时自适应节流，避免重复推理同一帧。
+   */
+  async _loop() {
+    this._lastVideoTime = -1;
+    this._lastDetect = 0;
+    this._detectCost = 0;
+    while (this.running) {
+      const v = this.video;
+      if (v.readyState >= 2 && v.videoWidth > 0 && v.currentTime !== this._lastVideoTime) {
+        const now = performance.now();
+        // 上一帧推理超过 22ms 时限频到 ~30fps，给渲染让出主线程
+        const minGap = this._detectCost > 22 ? 33 : 0;
+        if (now - this._lastDetect >= minGap) {
+          this._lastVideoTime = v.currentTime;
+          this._lastDetect = now;
+          const t0 = performance.now();
+          try {
+            const res = this.landmarker.detectForVideo(v, now);
+            this._detectCost = this._detectCost * 0.8 + (performance.now() - t0) * 0.2;
+            this._handleResults(res);
+          } catch (err) {
+            // 单帧失败不致命，记录后继续
+            console.warn('[HandTracker] detect 失败：', err);
+          }
+        }
+      }
+      // 让出主线程，与渲染循环交替
       await new Promise((r) => requestAnimationFrame(r));
     }
   }
 
   _handleResults(results) {
-    const all = results?.multiHandLandmarks || [];
-    const handedness = results?.multiHandedness || [];
+    /* tasks-vision 输出格式：
+         landmarks:      NormalizedLandmark[][]（画面归一化坐标）
+         worldLandmarks: Landmark[][]（米制 3D，原点在手几何中心）
+         handedness:     Category[][]（[{categoryName, score}]）
+       这里整理成与旧版一致的双手数据结构。 */
+    const all = results?.landmarks || [];
+    const worlds = results?.worldLandmarks || [];
+    const handedness = (results?.handedness || []).map((arr) => {
+      const c = arr?.[0] || {};
+      return { label: c.categoryName || '', score: c.score ?? 0 };
+    });
 
     /* ---------- 整理成双手数据 ----------
-       MediaPipe 的 multiHandLandmarks 顺序会随手出现顺序变化，
+       MediaPipe 的 landmarks 数组顺序会随手出现顺序变化，
        如果直接用下标 0/1，两只手会"串位"，导致左右手控制互换。
        这里按 handedness 的 label 排序（Left 在前、Right 在后），
        索引就稳定了；同时用 score 最高的那只作为"主手"。
 
-       注意：selfieMode=false 时，MediaPipe 报的 Left/Right 是
-       摄像头视角的标签（和镜子里的左右相反），这里统一换算成
-       "用户视角"的左右，方便使用者理解左手/右手的提示。 */
+       注意：tasks-vision 的 handedness 假定输入是镜像画面；
+       我们喂的是未镜像的原始摄像头帧，所以报出的 Left/Right
+       与用户实际左右相反，这里统一换算成"用户视角"。 */
     this.handsData = all.map((lm, i) => {
       const h = handedness[i] || {};
       // 摄像头视角 → 用户视角：标签互换
-      const cameraLabel = h.label || h.classification?.[0]?.label || '';
+      const cameraLabel = h.label || '';
       const userLabel = cameraLabel === 'Left' ? 'Right'
                       : cameraLabel === 'Right' ? 'Left' : '';
       // 掌心锚点（0/5/9/13/17 的均值）比单点稳
@@ -445,6 +606,7 @@ class HandTracker {
       cx /= ids.length; cy /= ids.length;
       return {
         landmarks: lm,
+        world: worlds[i] || null,
         label: userLabel,
         score: h.score ?? 0,
         // 注意：这里的 pointer 还是【未镜像】的原始视频坐标
@@ -468,6 +630,7 @@ class HandTracker {
       null;
 
     this.lastLandmarks = primary ? primary.landmarks : null;
+    this.lastWorldLandmarks = primary ? primary.world : null;
     this.lastHandedness = primary
       ? { label: primary.label, score: primary.score }
       : null;
@@ -482,6 +645,7 @@ class HandTracker {
       handedness: this.lastHandedness,
       hands: this.handsData,
       twoHand: this.twoHandActive,
+      worldLandmarks: this.lastWorldLandmarks,
     });
   }
 
@@ -637,9 +801,10 @@ class HandTracker {
     this.handsData = [];
     this.twoHandActive = false;
     this.lastLandmarks = null;
+    this.lastWorldLandmarks = null;
     this.pointerActive = false;
     this._drawOverlay([]);
-    this.onResults(null, { hands: [], twoHand: false });
+    this.onResults(null, { hands: [], twoHand: false, worldLandmarks: null });
   }
 
   /** 每帧调用：平滑手指指针位置 */
@@ -726,9 +891,9 @@ const FLOWER_VERT = /* glsl */ `
     float depth = -mv.z;
     float persp = clamp(5.6 / max(depth, 0.55), 0.35, 2.4);
     float sizeK = 0.55 + aInfo.y;
-    /* 花苞期只让一部分粒子可见（18% → 100%），否则 4 万颗挤在很小的体积里，
-       加法混合必然烧成一根白棒。这也让花朵"随张开逐渐浮现"，观感更好。 */
-    float keep = 0.18 + 0.82 * b;
+    /* 花苞期只让一部分粒子可见（30% → 100%）：苞体的粒子名义上摊在整片
+       花瓣上，收拢后挤在同一个小体积里，加法混合必然烧成一根白棒。 */
+    float keep = 0.30 + 0.70 * b;
     float vis = step(seed, keep);
     gl_PointSize = clamp(uSize * sizeK * uPixelRatio * persp, 1.0, 48.0) * vis;
     if (depth < 0.6) gl_PointSize = 0.0;
@@ -749,9 +914,8 @@ const FLOWER_VERT = /* glsl */ `
     /* 指尖附近更亮 */
     if (uPointerActive > 0.5) glow += exp(-distP * distP * 1.6) * 0.9;
 
-    /* 花苞期 4 万颗粒子挤在很小的体积里，加法混合会直接烧成一个白棒 ——
-       压到 22% 亮度才刚刚好：能看出玫红的苞，又不至于刺眼。 */
-    glow *= mix(0.22, 1.0, b);
+    /* 花苞期依旧要压亮度：苞体小、粒子密，加法混合容易烧白。 */
+    glow *= mix(0.23, 1.0, b);
 
     vColor = col;
     vAlpha = mix(0.34, 1.0, b) * uFade;
@@ -921,13 +1085,38 @@ class FlowerField {
         const yy = y + (Math.random() - 0.5) * 0.03;
         toBloom(x, yy, z);
 
-        // 花苞：同样角度、缩小收拢成一个尖苞
-        const budR = 0.16 + Math.random() * 0.12;
-        const budH = Math.pow(Math.random(), 0.6) * 0.92;
+        /* ---------- 花苞：6 片花瓣各自卷合，收成一个闭合的尖苞 ----------
+           每颗粒子保留它在瓣上的角度 th 与径向位置 u：
+             u → 苞体的高度（0 = 瓣根在苞底，1 = 瓣尖收在苞顶）
+             瓣心半径大、瓣与瓣的接缝处半径小 → 六道竖向瓣沟
+           原来那版是半径 0.16 的细柱，收拢起来就是一根白棒；
+           现在有瓣、有沟、有尖顶，才看得出"这是花苞"。 */
+        const sector = (Math.PI * 2) / CONFIG.petalCount;
+        const thP = th - (layer ? Math.PI / CONFIG.petalCount : 0);  // 内层去掉自己的相位
+        const pc = Math.round(thP / sector) * sector;                // 所属花瓣的中心角
+        const dAng = clamp(Math.abs(thP - pc) / (sector * 0.5));     // 0 = 瓣心，1 = 接缝
+        const rib = Math.pow(Math.cos(dAng * Math.PI * 0.5), 0.7);   // 瓣心 1 → 接缝 0
+
+        const v = Math.pow(u, 0.9);                                  // 瓣根 → 瓣尖
+        const layerK = layer ? 0.62 : 1.0;                           // 内层收在外层里面
+        /* 苞体侧影：底部收窄 0.7、1/3 高处最宽、往上收成尖顶 —— 这是花苞的轮廓；
+           旧版「从底到顶一路变细」画出来是个圆锥，不像苞。 */
+        const RMAX = 0.46;
+        const profile = v < 0.45
+          ? 0.70 + 0.30 * Math.pow(v / 0.45, 0.6)
+          : Math.pow(Math.max(0, 1 - Math.pow((v - 0.45) / 0.55, 1.8)), 0.8);
+        const Rb = (RMAX * profile + 0.02) * layerK;
+        /* 瓣尖散开一点：所有瓣尖都收到同一个点会烧出一根白刺 */
+        const tipScatter = v > 0.75 ? Math.random() * 0.09 * (v - 0.75) / 0.25 : 0;
+        const tipSplay = smoothstep(0.82, 1, v) * 0.06;               // 顶端瓣尖微微外翻
+        // rib^0.55：瓣面宽阔、只有接缝处收窄，才看得出"一片片的花瓣"
+        const rBud = (Rb + tipScatter + tipSplay) * (0.66 + 0.46 * Math.pow(rib, 0.55));
+        const tw = 0.28 * v;                                         // 苞体轻轻拧一下（真花苞的螺旋感）
+        const yBud = 0.05 + v * (layer ? 0.90 : 1.20);
         toBud(
-          Math.cos(th) * budR * (1 - budH * 0.55),
-          budH * 0.85 + 0.05,
-          Math.sin(th) * budR * (1 - budH * 0.55)
+          Math.cos(th + tw) * rBud,
+          yBud + (Math.random() - 0.5) * 0.02,
+          Math.sin(th + tw) * rBud
         );
 
         /* 颜色：瓣缘最亮，往里偏暖，最深处带一点金 */
@@ -950,7 +1139,8 @@ class FlowerField {
         const rr = Math.pow(Math.random(), 0.55) * 0.30;
         const y = 0.12 + Math.pow(Math.random(), 0.8) * 0.30;
         toBloom(Math.cos(a) * rr, y, Math.sin(a) * rr);
-        toBud(Math.cos(a) * rr * 0.35, 0.55 + y * 0.3, Math.sin(a) * rr * 0.35);
+        // 花苞里金粉藏在苞心偏下的位置，只透出一点暖光
+        toBud(Math.cos(a) * rr * 0.30, 0.12 + Math.pow(Math.random(), 0.9) * 0.34, Math.sin(a) * rr * 0.30);
 
         tmp.copy(C_CORE).offsetHSL((Math.random() - 0.5) * 0.05, 0, (Math.random() - 0.5) * 0.08);
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
@@ -965,7 +1155,8 @@ class FlowerField {
         const rr = 1.5 + Math.random() * 1.8;
         const y = (Math.random() - 0.45) * 1.8;
         toBloom(Math.cos(a) * rr, y, Math.sin(a) * rr);
-        toBud(Math.cos(a) * rr * 0.3, 0.1 + Math.random() * 0.8, Math.sin(a) * rr * 0.3);
+        // 花苞期尘埃围在苞体外侧，撑出一层很薄的辉光
+        toBud(Math.cos(a) * rr * 0.30, 0.10 + Math.random() * 1.30, Math.sin(a) * rr * 0.30);
 
         tmp.copy(C_MOTE).offsetHSL(0, 0, (Math.random() - 0.5) * 0.1);
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
@@ -1898,6 +2089,7 @@ class App {
       overlay: $('overlay'),
       onResults: (lm, info) => {
         this.landmarks = lm;
+        this.worldLandmarks = info?.worldLandmarks || null;
         this.handsInfo = info || {};
       },
       onError: (msg) => this.ui.toast(msg),
@@ -1914,6 +2106,7 @@ class App {
     if (restored) this.ui.toast('已载入上次的参数（按 R 可恢复初始状态）', 2600);
 
     this.landmarks = null;
+    this.worldLandmarks = null;
     this.handsInfo = {};
 
     this._bindVisibility();
@@ -2077,6 +2270,22 @@ class App {
     });
   }
 
+  /** 屏幕归一化坐标（0~1，已镜像）→ 花朵平面（z = CONFIG.followZ）上的世界坐标 */
+  _screenToPlane(nx, ny) {
+    const cam = this.stage.camera;
+    const dir = new THREE.Vector3(nx * 2 - 1, 1 - ny * 2, 0.5)
+      .unproject(cam).sub(cam.position).normalize();
+    const dz = Math.abs(dir.z) < 1e-4 ? 1e-4 : dir.z;
+    const t = (CONFIG.followZ - cam.position.z) / dz;
+    return cam.position.clone().addScaledVector(dir, t);
+  }
+
+  /** 手掌尺度：腕(0) → 中指根(9) 的画面归一化距离，用来决定花朵的相对大小 */
+  _palmSpan(lm) {
+    const a = lm[0], b = lm[9];
+    return Math.hypot(b.x - a.x, b.y - a.y) || CONFIG.palmSpanRef;
+  }
+
   start() {
     if (this.running) return;
     this.running = true;
@@ -2098,7 +2307,7 @@ class App {
     /* ---------- ① 输入 → targetTension ---------- */
     let pointerActive = false;
     if (isHand) {
-      this.tension.update(this.landmarks, dt);
+      this.tension.update(this.landmarks, dt, this.worldLandmarks);
       this.targetTension = this.tension.value;
       pointerActive = this.handTracker.pointerActive && !this.useMouseOverride;
     } else {
@@ -2133,15 +2342,32 @@ class App {
       this.threeHold = 0;
     }
 
-    /* ---------- ③ 指尖 / 鼠标的世界坐标（近似） ---------- */
+    /* ---------- ②.8 花朵跟着手掌走 ----------
+       把掌心的屏幕坐标反投影到花朵所在的平面，整朵花就这样悬在掌心、
+       跟着手一起动；手掌靠近摄像头（画面里更大）时花也略大一点。 */
+    const group = this.stage.flower.group;
+    let fx = 0, fy = 0, fs = 1;
+    if (isHand && this.handTracker.pointerActive && this.landmarks) {
+      const palm = this.handTracker.pointer;                 // 已镜像的归一化坐标
+      const hit = this._screenToPlane(palm.x, palm.y);
+      const span = this._palmSpan(this.landmarks);
+      fx = clamp(hit.x, -3.2, 3.2) * CONFIG.handFollow;
+      fy = clamp(hit.y, -2.2, 2.2) * CONFIG.handFollow + CONFIG.handLift;
+      fs = 1 + clamp(span / CONFIG.palmSpanRef - 1, -0.28, 0.35) * CONFIG.handScale;
+    }
+    const ease = CONFIG.handFollowEase;
+    group.position.x = damp(group.position.x, fx, ease, dt);
+    group.position.y = damp(group.position.y, fy, ease, dt);
+    group.scale.setScalar(damp(group.scale.x, fs, ease, dt));
+
+    /* ---------- ③ 指尖 / 鼠标的世界坐标 ----------
+       排斥与点亮用食指指尖（8 号点）：花已经跟着掌心走了，
+       若还用掌心做排斥点，就是往花心正中挖一个洞。 */
     const ptr = this.stage.flower.uniforms.uPointer.value;
-    if (pointerActive) {
-      // 把归一化屏幕坐标粗略映射到花朵附近
-      ptr.set(
-        (this.handTracker.pointer.x - 0.5) * 5.2,
-        (0.5 - this.handTracker.pointer.y) * 3.4 + 0.6,
-        1.4
-      );
+    if (pointerActive && this.landmarks) {
+      const tip = this.landmarks[8];
+      const hit = this._screenToPlane(1 - tip.x, tip.y);      // 镜像回用户视角
+      ptr.set(hit.x - group.position.x, hit.y - group.position.y, 0.55);
     } else if (this.mode === 'mouse') {
       // 鼠标：用屏幕坐标反推一个 3D 点（花盘平面上）
       ptr.set(

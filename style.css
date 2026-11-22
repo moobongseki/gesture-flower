@@ -448,3 +448,60 @@ input[type="range"]::-moz-range-thumb {
 @media (prefers-reduced-motion: reduce) {
   .cursor-dot, .toast, #overlay { transition: none; }
 }
+
+/* ---------------- 模型加载进度遮罩 ---------------- */
+.load-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(5, 6, 13, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.load-overlay[hidden] { display: none; }
+.load-card {
+  width: min(340px, 84vw);
+  padding: 22px 26px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  background: var(--panel-bg);
+  text-align: center;
+}
+.load-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  margin-bottom: 10px;
+  background: linear-gradient(90deg, #7ce7ff, #ff7ac6);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.load-label {
+  font-size: 12px;
+  color: var(--ink-dim);
+  margin-bottom: 12px;
+  min-height: 18px;
+}
+.load-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.load-track i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #7ce7ff, #ff7ac6);
+  transition: width 0.15s ease;
+}
+.load-pct {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--ink-dim);
+  font-variant-numeric: tabular-nums;
+}

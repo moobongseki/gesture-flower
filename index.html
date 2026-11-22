@@ -34,7 +34,7 @@
   <!-- 3) 左上角标题 -->
   <header class="title-card">
     <h1>指尖花开</h1>
-    <p>MediaPipe Hands · Three.js 粒子花朵</p>
+    <p>MediaPipe HandLandmarker · Three.js 粒子花朵</p>
   </header>
 
   <!-- 4) 右上角控件：模式切换 / 重试摄像头 / 面板开关 -->
@@ -87,8 +87,17 @@
   <div id="toast" class="toast" role="alert" aria-live="polite"></div>
   <div id="cursorDot" class="cursor-dot"></div>
 
-  <!-- 9) MediaPipe Hands（UMD，挂 window.Hands） -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+  <!-- 8.5) 模型加载进度遮罩 -->
+  <div id="loadOverlay" class="load-overlay" hidden>
+    <div class="load-card">
+      <div class="load-title">指尖花开</div>
+      <div class="load-label" id="loadLabel">正在加载手部识别模型…</div>
+      <div class="load-track"><i id="loadBar" style="width:0%"></i></div>
+      <div class="load-pct" id="loadPct">0%</div>
+    </div>
+  </div>
+
+  <!-- 9) MediaPipe tasks-vision 由 main.js 按需多源加载（本地模型优先，带进度条） -->
   <script type="module" src="./main.js"></script>
 </body>
 </html>
