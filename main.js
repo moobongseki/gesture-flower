@@ -1297,6 +1297,9 @@ class FlowerField {
     this.bloomPos = posBloom.slice();
     this.heartPos = posHeart;
     this.seedArr = info;          // info[4i] 是随机种子，用来给粒子错峰
+    /* 颜色也要留一份底：化形成心时会把 aColor 乘上一个"补光系数"，
+       把核心衰减（coreAtten，0.38 起）抵回来；收回时按底稿原样恢复。 */
+    this.baseColor = colors.slice();
     this._heartPrev = 0;
 
     this.uniforms = {
@@ -1363,6 +1366,12 @@ class FlowerField {
       const geo = this.points.geometry;
       const attr = geo.getAttribute('position');
       const A = attr.array, B = this.bloomPos, H = this.heartPos, S = this.seedArr;
+      /* 爱心是实心图形，整颗心腹都落在 coreAtten 的衰减区里（0.38 起步），
+         所以这里按"心体离中心多近"给 aColor 乘一个补光系数：
+         心腹最亮、贴边处不补，形状轮廓靠亮边撑住，心腹不至于糊成一团脏粉色。
+         收敛到 0 时按底稿写回，花朵颜色和原来完全一致。 */
+      const colAttr = geo.getAttribute('aColor');
+      const C = colAttr.array, CB = this.baseColor;
       const n = attr.count;
       for (let i = 0; i < n; i++) {
         const o = i * 3;
@@ -1378,8 +1387,19 @@ class FlowerField {
         A[o]     = mx * ca - mz * sa;
         A[o + 1] = B[o + 1] + (H[o + 1] - B[o + 1]) * hi;
         A[o + 2] = mx * sa + mz * ca;
+
+        const hr = Math.sqrt(H[o] * H[o] + H[o + 2] * H[o + 2]);
+        const att = 1 - Math.min(1, Math.max(0, (hr - 0.02) / (0.85 - 0.02)));
+        const smooth = att * att * (3 - 2 * att);
+        /* 分通道补光：红提得最多、绿最少，亮度上去了颜色还留在玫瑰红里，
+           否则三通道一起拉会把心腹洗成白色一团 */
+        const k = hi * smooth;
+        C[o]     = CB[o]     * (1 + 0.62 * k);
+        C[o + 1] = CB[o + 1] * (1 + 0.26 * k);
+        C[o + 2] = CB[o + 2] * (1 + 0.40 * k);
       }
       attr.needsUpdate = true;
+      colAttr.needsUpdate = true;
     }
     u.uTime.value += dt;
     u.uPointer.value.copy(state.pointer);
@@ -1892,9 +1912,12 @@ class Stage {
        形变中途粒子被往里收，密度会临时暴涨，再给一个"中途压暗"，
        否则整段转化就是一团白光闪过去。 */
     const dip = 1 - 0.55 * Math.sin(Math.PI * hh);
-    this.flower.uniforms.uGlow.value = params.glowIntensity * (1 - 0.35 * hh) * dip;
-    this.flower.uniforms.uSize.value = params.particleSize * (1 - 0.24 * hh);
-    this.bloomPass.strength = params.bloomStrength * (1 - 0.5 * hh) * dip;
+    /* 爱心是"实心"的：整个心体都在中轴附近（radial 0.1~0.6），
+       如果还按花朵那套收尾压暗（glow -35%、size -24%、bloom -50%），
+       心腹就会暗成一块脏粉色。这里收尾只是略微压低一点，保住体积感。 */
+    this.flower.uniforms.uGlow.value = params.glowIntensity * (1 - 0.16 * hh) * dip;
+    this.flower.uniforms.uSize.value = params.particleSize * (1 - 0.12 * hh);
+    this.bloomPass.strength = params.bloomStrength * (1 - 0.30 * hh) * dip;
     this.composer.render();
   }
 }
