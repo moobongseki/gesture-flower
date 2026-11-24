@@ -280,10 +280,11 @@ console.log('\n[5] 花瓣几何（极坐标玫瑰曲线）');
   ok('花瓣锐度在合理区间（0.2~2）', CFG.petalSharp > 0.2 && CFG.petalSharp < 2);
   ok('花瓣用 |cos(kθ/2)|^sharp 的极坐标玫瑰曲线',
     /Math\.pow\(Math\.abs\(Math\.cos\(\(k \* theta\) \/ 2\)\),\s*s\)/.test(mainSrc));
-  ok('内层用更小的锐度指数（花瓣更圆润）', /const sharpLocal = layer \? sharp \* 0\.6 : sharp;/.test(mainSrc));
+  ok('重瓣玫瑰按 6 圈分瓣（3/5/7/9/11/13 共 48 片）',
+    /const ROSE_RINGS = [\s\S]*?n: 3,[\s\S]*?n: 5,[\s\S]*?n: 7,[\s\S]*?n: 9,[\s\S]*?n: 11,[\s\S]*?n: 13,[\s\S]*?\];/.test(mainSrc));
   ok('半径用 sqrt 采样，粒子在面积上均匀（否则全挤圆心）',
     /Math\.sqrt\(Math\.random\(\)\)/.test(mainSrc));
-  ok('内外两层花瓣（内层旋转 30°）', /Math\.PI \/ CONFIG\.petalCount/.test(mainSrc));
+  ok('相邻两圈花瓣错开半瓣（不是辐条状排开）', /ringIdx % 2 \? sector \* 0\.5 : 0/.test(mainSrc));
   ok('花心 + 尘埃占比合理', CFG.centerRatio + CFG.moteRatio < 0.5);
 
   const peaksOf = (k, sharp) => {
@@ -446,10 +447,10 @@ console.log('\n[8] 彩蛋（三指 → Love）');
     const m = timing && timing[1].match(new RegExp(`${k}:\\s*([\\d.]+)`));
     return m ? parseFloat(m[1]) : NaN;
   };
-  ok(`消失阶段约 0.45 秒（实际 ${tv('vanish')}）`, Math.abs(tv('vanish') - 0.45) < 1e-6);
-  ok(`书写阶段约 4.6 秒、比原来慢近一倍（实际 ${tv('write')}）`, tv('write') >= 4.0);
-  ok(`停留阶段约 2.4 秒（实际 ${tv('hold')}）`, tv('hold') >= 2.0);
-  ok(`回归阶段约 0.9 秒（实际 ${tv('return')}）`, Math.abs(tv('return') - 0.9) < 1e-6);
+  ok(`消失阶段约 0.7 秒（实际 ${tv('vanish')}）`, Math.abs(tv('vanish') - 0.7) < 1e-6);
+  ok(`书写阶段约 7.2 秒、比原来再慢一截（实际 ${tv('write')}）`, tv('write') >= 7.0);
+  ok(`停留阶段约 3.2 秒（实际 ${tv('hold')}）`, tv('hold') >= 3.0);
+  ok(`回归阶段约 1.3 秒（实际 ${tv('return')}）`, Math.abs(tv('return') - 1.3) < 1e-6);
   ok('update 里用的是常量而不是写死的秒数',
     /this\.t \/ T\.write/.test(mainSrc) && /this\.t >= T\.hold/.test(mainSrc));
 

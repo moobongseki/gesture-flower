@@ -938,8 +938,10 @@ const FLOWER_VERT = /* glsl */ `
        颜色就全丢了。这里按离轴距离给一点衰减。 */
     float centerBoost = role > 0.5 && role < 1.5 ? 0.95 : 1.0;
     float radial = length(pos.xz);
-    float coreAtten = mix(0.38, 1.0, smoothstep(0.02, 0.85, radial));
-    float glow = uGlow * uDensity * centerBoost * coreAtten * (0.72 + 0.55 * seed);
+    float coreAtten = mix(0.72, 1.0, smoothstep(0.05, 0.92, radial));
+    /* 体积感：越靠花头底部越暗（环境光被花瓣挡住），顶上更亮 —— 照片里的那种厚度 */
+    float volShade = 0.62 + 0.38 * smoothstep(-0.25, 0.85, pos.y);
+    float glow = uGlow * uDensity * centerBoost * coreAtten * volShade * (0.80 + 0.40 * seed);
 
     /* 指尖附近更亮 */
     if (uPointerActive > 0.5) glow += exp(-distP * distP * 1.6) * 0.9;
@@ -1024,6 +1026,9 @@ class FlowerField {
     const C_MID = new THREE.Color().setHSL(0.940, 0.90, 0.62);    // 瓣面
     const C_EDGE = new THREE.Color().setHSL(0.930, 0.95, 0.70);   // 瓣缘亮粉
     const C_MOTE = new THREE.Color().setHSL(0.13, 0.55, 0.82);    // 尘埃暖白
+    const C_DEEP = new THREE.Color().setHSL(0.955, 0.78, 0.54);  // 花心深玫瑰粉
+    const C_PALE = new THREE.Color().setHSL(0.952, 0.60, 0.71);  // 外瓣奶油粉
+    const C_TIP = new THREE.Color().setHSL(0.946, 0.38, 0.81);   // 瓣尖亮线（奶油白）
 
 /* ---------- 上下两朵花，看起来长在同一根"茎"上 ----------
        下面这朵是主花（大），上面这朵小一号（0.58 倍）并自动抬高，
@@ -1038,6 +1043,25 @@ class FlowerField {
     const k = CONFIG.petalCount;
     const sharp = CONFIG.petalSharp;
     const tmp = new THREE.Color();
+
+    /* 仙子之吻是一朵**重瓣小玫瑰**，不是六片大瓣的荷花：
+       五圈花瓣由内向外层层放大，瓣数 3/5/7/9/11（共 35 片），
+       内圈又短又立、杯口深（抱心），外圈又长又展、瓣尖微微回卷。
+         rad  ：这一圈花瓣的起根半径
+         len  ：这一圈花瓣的长度（相对）
+         arch ：纵向拱起量（内圈大 → 立起来）
+         cup  ：横向杯口深度（内圈大 → 兜住花心）
+         open ：展开度（外圈 1 → 往平面铺开）
+         lift ：整圈花瓣的抬升（内圈略抬高，外圈略下沉） */
+    const ROSE_RINGS = [
+      { n: 3,  rad: 0.06, len: 0.26, arch: 0.62, cup: 0.14, open: 0.12, lift: 0.14 },
+      { n: 5,  rad: 0.18, len: 0.44, arch: 0.56, cup: 0.18, open: 0.28, lift: 0.10 },
+      { n: 7,  rad: 0.33, len: 0.66, arch: 0.48, cup: 0.21, open: 0.50, lift: 0.07 },
+      { n: 9,  rad: 0.51, len: 0.86, arch: 0.38, cup: 0.24, open: 0.70, lift: 0.05 },
+      { n: 11, rad: 0.69, len: 1.00, arch: 0.29, cup: 0.27, open: 0.86, lift: 0.05 },
+      { n: 13, rad: 0.87, len: 1.10, arch: 0.22, cup: 0.29, open: 0.84, lift: 0.07 },
+    ];
+    const ROSE_WEIGHT = ROSE_RINGS.reduce((a, r) => a + r.n * r.len, 0);
 
     /* ---------- 爱心目标点池（两指 V 时粒子聚成的心） ----------
        用经典参数心形曲线
@@ -1175,95 +1199,147 @@ class FlowerField {
 
       if (!isCore && !isMote) {
         /* ---------- 花瓣粒子 ----------
-           θ 用「按 r(θ) 加权」的拒绝采样：让粒子聚到 6 个瓣上、
-           瓣与瓣之间的缝留空。均匀取 θ 的话，缝隙处 r≈0 的粒子
-           全堆在圆心，花就糊成一个盘，看不出花瓣。 */
-        let theta = 0;
-        let rMax = 0;
-        /* 内层的花瓣用更小的锐度指数 → 花瓣更宽更圆，
-           这样它虽小，但看起来和外层是同一个品种的瓣。 */
-        const sharpLocal = layer ? sharp * 0.6 : sharp;
-        for (let tries = 0; tries < 8; tries++) {
-          theta = Math.random() * Math.PI * 2;
-          rMax = petalR(theta, sharpLocal);
-          if (Math.random() < rMax * rMax) break;     // 留在瓣上
+           不按极坐标玫瑰曲线撒点，而是把每一片花瓣当成一张**有曲率的曲面**来采样。
+           取 (瓣号 pIdx, 纵向 uu, 横向 s) 三个参数：
+             uu：瓣根 0 → 瓣尖 1（sqrt 采样，落点面积均匀）
+             s ：−1…1，瓣心线两侧的横向位置
+           在这张面上叠四种形变，才像一朵真花，而不是一片塑料扇子：
+             wShape  瓣宽包络：根部窄、六成处最宽、尖端收圆
+             arch    纵向拱起：瓣面中段隆起，瓣尖微微回头
+             cup     横向杯口：两侧瓣缘向上兜，像一只浅勺
+             ruffle  瓣缘细褶：只有外缘才有的那层细密皱边
+           再加上每片瓣自己的长度 petalVar 与侧倾 petalRoll，
+           六片瓣各不相同，才不像复制粘贴出来的。 */
+        /* ---------- 花瓣粒子：落在重瓣玫瑰的某一层瓣面上 ----------
+           参数 (uu, s)：uu 瓣根 0 → 瓣尖 1；s 瓣心线两侧 −1…1。
+           三种形变叠出真花瓣的厚度与卷边：
+             rise  纵向拱起（内圈直立抱心、外圈平铺）
+             cup   横向杯口（两侧瓣缘向上兜成一只浅勺）
+             curl  瓣尖回卷（外圈瓣尖往外翻，玫瑰的典型卷边）
+           再叠加错位角：相邻两圈错开半瓣、每圈再加一点螺旋偏置，
+           花瓣才是一层压一层，而不是辐条一样排开。 */
+        const wRing = Math.random() * ROSE_WEIGHT;
+        let ringIdx = 0, accW = 0;
+        for (let q = 0; q < ROSE_RINGS.length; q++) {
+          accW += ROSE_RINGS[q].n * ROSE_RINGS[q].len;
+          if (wRing <= accW) { ringIdx = q; break; }
         }
-        const u = Math.sqrt(Math.random());            // 面积均匀
+        const R = ROSE_RINGS[ringIdx];
+        const ringNorm = ringIdx / (ROSE_RINGS.length - 1);          // 0 = 最内圈，1 = 最外圈
+        const pi = (Math.random() * R.n) | 0;
+        const pVar = 0.86 + 0.24 * (((pi * 7 + ringIdx * 13) % 11) / 10);  // 每片瓣长短错得开，瓣尖才不会连成一条亮弧
+        const pRoll = ((((ringIdx * 11 + pi * 7) % 9) / 8) - 0.5) * 0.13; // 侧倾 ±0.065
+        const sector = (Math.PI * 2) / R.n;
+        const ringRot = (ringIdx % 2 ? sector * 0.5 : 0) + ringIdx * 0.40 + pRoll * 0.2;
+        const pc = pi * sector + ringRot;
 
-        /* 两层花瓣**都从同一个花心长出来**（u→0 时 r→0、y→0），
-           区别只在"张开程度"：
-             外层：开得透 —— 半径大、几乎平铺，瓣尖微微上翘
-             内层：开得含蓄 —— 半径只有 0.52 倍，但随半径快速升高，
-                   形成一个立在花心上的小杯（这才是真花的"两层"）
-           注意内层不能整体抬高：那样花瓣根部就悬在中心上方了，
-           看起来像两朵花叠在一起，而不是一朵花的两层。 */
-        const layerScale = layer ? 0.55 : 1.0;
-        const layerRot = layer ? Math.PI / CONFIG.petalCount : 0;
+        const s = Math.random() * 2 - 1;                  // 瓣面按面积均匀铺，不留瓣心亮脊
+        const uu = Math.min(1, Math.sqrt(Math.random()) * 0.997 + Math.random() * 0.003);
+        const baseR = R.rad * CONFIG.bloomScale * (0.94 + 0.10 * (((pi * 5 + ringIdx * 9) % 8) / 7));
+        const pLen = R.len * CONFIG.bloomScale * pVar;
+        const wShape = 0.55 + 0.45 * Math.sin(Math.PI * Math.pow(uu, 0.95));
+        const edgeWave = 1
+          + 0.030 * Math.sin(uu * 7.6 + pi * 1.7 + ringIdx)
+          + 0.012 * Math.sin(uu * 15.3 + pi * 2.9);
+        const halfAng = sector * 0.40 * wShape * edgeWave;
 
-        // 抖一下 θ，让瓣缘不是硬边
-        const th = theta + layerRot + (Math.random() - 0.5) * 0.05;
-        const r = (0.13 + 0.87 * u) * rMax * 1.55 * layerScale * CONFIG.bloomScale;
+        /* 把一片瓣写成 (uu, s) → 三维点的函数。
+           有了这个函数就能用差商算出瓣面法线，再按光照给瓣面着色：
+           朝向光的瓣面亮、侧过去的瓣面暗，一层层明暗才立得住。
+           没有这一步，粒子只能靠「瓣缘挑亮」假装起伏，看着就是一把扇子。 */
+        const petalAt = (t, ss) => {
+          const wS = Math.pow(Math.sin(Math.PI * Math.pow(t, 1.05)), 0.72);
+          const wave = 1
+            + 0.030 * Math.sin(t * 7.6 + pi * 1.7 + ringIdx)
+            + 0.012 * Math.sin(t * 15.3 + pi * 2.9);
+          const ang = sector * 0.40 * wS * wave;
+          const rr = baseR + pLen * 0.92 * Math.pow(t, 0.95)
+            + Math.sin(t * 5.4 + pi * 2.1 + ringIdx) * 0.008 * wS;
+          const yy = R.arch * Math.pow(t, 1.30) + R.lift
+            - 0.14 * R.open * smoothstep(0.45, 1, ringNorm) * Math.pow(smoothstep(0.60, 1, t), 1.6)
+            + R.cup * 1.18 * ss * ss * (0.22 + 0.78 * wS)
+            + (Math.sin(ss * 8.6 + t * 3.4) * 0.009 + Math.sin(ss * 14.9 - t * 1.9) * 0.004) * smoothstep(0.4, 1, Math.abs(ss))
+            + pRoll * (ang * ss) * rr;
+          const tt = pc + ang * ss;
+          return [Math.cos(tt) * rr, yy, Math.sin(tt) * rr];
+        };
 
-        const x = Math.cos(th) * r;
-        const z = Math.sin(th) * r;
-        /* 高度剖面（u 越小越靠花心，两层在 u→0 处都收在同一点）：
-             外层 y = 0.07·u + 0.15·u³          基本平铺，只有瓣尖翘起来
-             内层 y = 0.40·u^1.12               从花心升上去，开口比外层浅
-           摊开度的差别 = 外层 r 大而 y 小、内层 r 小而 y 大。 */
-        const y = layer
-          ? Math.pow(u, 1.12) * 0.40
-          : u * 0.07 + Math.pow(u, 3) * 0.15;
-        const yy = y + (Math.random() - 0.5) * 0.03;
-        toBloom(x, yy, z);
+        const p0 = petalAt(uu, s);
+        const pU = petalAt(Math.min(1, uu + 0.03), s);
+        const sStep = s > 0.90 ? -0.08 : 0.08;
+        const pS = petalAt(uu, Math.min(1, Math.max(-1, s + sStep)));
+        const tx = pU[0] - p0[0], ty = pU[1] - p0[1], tz = pU[2] - p0[2];
+        const qx = (pS[0] - p0[0]) * (sStep > 0 ? 1 : -1);
+        const qy = (pS[1] - p0[1]) * (sStep > 0 ? 1 : -1);
+        const qz = (pS[2] - p0[2]) * (sStep > 0 ? 1 : -1);
+        let nx = ty * qz - tz * qy, ny = tz * qx - tx * qz, nz = tx * qy - ty * qx;
+        const nLen = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        nx /= nLen; ny /= nLen; nz /= nLen;
+        /* 主光从左上前方来；花瓣是双面的，法线翻过来也照样受光 */
+        const lambert = Math.abs(nx * 0.16 + ny * 0.95 + nz * 0.28);
 
-        /* ---------- 花苞：6 片花瓣各自卷合，收成一个闭合的尖苞 ----------
-           每颗粒子保留它在瓣上的角度 th 与径向位置 u：
-             u → 苞体的高度（0 = 瓣根在苞底，1 = 瓣尖收在苞顶）
-             瓣心半径大、瓣与瓣的接缝处半径小 → 六道竖向瓣沟
-           原来那版是半径 0.16 的细柱，收拢起来就是一根白棒；
-           现在有瓣、有沟、有尖顶，才看得出"这是花苞"。 */
-        const sector = (Math.PI * 2) / CONFIG.petalCount;
-        const thP = th - (layer ? Math.PI / CONFIG.petalCount : 0);  // 内层去掉自己的相位
-        const pc = Math.round(thP / sector) * sector;                // 所属花瓣的中心角
-        const dAng = clamp(Math.abs(thP - pc) / (sector * 0.5));     // 0 = 瓣心，1 = 接缝
-        const rib = Math.pow(Math.cos(dAng * Math.PI * 0.5), 0.7);   // 瓣心 1 → 接缝 0
+        const th = pc + halfAng * s;
+        /* 花心补一小团紧卷的粒子：只靠外圈花瓣的话，正中间会空出一个洞，
+           实拍的仙子之吻花心是实心的一小团卷瓣。 */
+        const coreFill = Math.random() < 0.016;
+        let px, py, pz;
+        if (coreFill) {
+          const rr = 0.19 * Math.sqrt(Math.random());
+          const aa = th * 1.6 + Math.random() * 0.5;
+          px = Math.cos(aa) * rr;
+          pz = Math.sin(aa) * rr;
+          py = 0.34 - 0.45 * rr + Math.sin(rr * 26 + uu * 6) * 0.010;
+        } else {
+          px = p0[0];
+          py = p0[1];
+          pz = p0[2];
+        }
+        toBloom(px, py, pz);
 
-        const v = Math.pow(u, 0.9);                                  // 瓣根 → 瓣尖
-        const layerK = layer ? 0.62 : 1.0;                           // 内层收在外层里面
-        /* 苞体侧影：底部收窄 0.7、1/3 高处最宽、往上收成尖顶 —— 这是花苞的轮廓；
-           旧版「从底到顶一路变细」画出来是个圆锥，不像苞。 */
+        /* ---------- 花苞：同一套 (uu, s)，换成「一层压一层」的卷合苞 ----------
+           |s| 决定离接缝多远（瓣心半径大、接缝半径小 → 竖向瓣沟），
+           内圈收得更紧、外圈裹得更松，苞顶的瓣尖高低错落。 */
+        const rib = Math.pow(Math.cos(Math.min(1, Math.abs(s)) * Math.PI * 0.5), 0.7);
+        const v = Math.pow(uu, 0.9);
+        const layerK = 0.55 + 0.45 * ringNorm;
         const RMAX = 0.46;
         const profile = v < 0.45
           ? 0.70 + 0.30 * Math.pow(v / 0.45, 0.6)
           : Math.pow(Math.max(0, 1 - Math.pow((v - 0.45) / 0.55, 1.8)), 0.8);
         const Rb = (RMAX * profile + 0.02) * layerK;
-        /* 瓣尖散开一点：所有瓣尖都收到同一个点会烧出一根白刺 */
         const tipScatter = v > 0.75 ? Math.random() * 0.09 * (v - 0.75) / 0.25 : 0;
-        const tipSplay = smoothstep(0.82, 1, v) * 0.06;               // 顶端瓣尖微微外翻
-        // rib^0.55：瓣面宽阔、只有接缝处收窄，才看得出"一片片的花瓣"
+        const tipSplay = smoothstep(0.82, 1, v) * 0.06;
         const rBud = (Rb + tipScatter + tipSplay) * (0.66 + 0.46 * Math.pow(rib, 0.55));
-        const tw = 0.28 * v;                                         // 苞体轻轻拧一下（真花苞的螺旋感）
-        const yBud = 0.05 + v * (layer ? 0.90 : 1.20);
+        const tw = 0.26 * v + ringIdx * 0.12;                        // 卷合的螺旋感
+        const yBud = 0.05 + v * (0.94 + 0.26 * ringNorm) * (0.94 + 0.06 * pLen);
         toBud(
           Math.cos(th + tw) * rBud,
           yBud + (Math.random() - 0.5) * 0.02,
           Math.sin(th + tw) * rBud
         );
-        toHeart(1.0);                          // 花瓣粒子铺满整颗心
+        toHeart(1.0);                                                 // 花瓣粒子铺满整颗心
 
-        /* 颜色：瓣缘最亮，往里偏暖，最深处带一点金 */
-        const edgeT = clamp(u);
-        tmp.copy(C_MID)
-          .lerp(C_EDGE, Math.pow(edgeT, 2.2) * 0.85)
-          .lerp(C_INNER, (1 - edgeT) * 0.55);
-        if (layer) tmp.lerp(C_CORE, 0.22);
-        tmp.offsetHSL((Math.random() - 0.5) * 0.012, 0, (Math.random() - 0.5) * 0.06);
+        /* 颜色：花心深玫瑰粉 → 外瓣奶油粉（实拍的仙子之吻就是这个方向），
+           瓣尖和瓣缘再挑亮一层，卷边上那道亮线就是它 */
+        const tipT = Math.pow(uu, 3.0) * 0.40;
+        const edgeT = Math.abs(s) * (0.30 + 0.70 * uu);
+        const vein = Math.sin(s * 12.4 + uu * 4.1 + pi * 0.9) * 0.5 + 0.5;
+        tmp.copy(C_DEEP)
+          .lerp(C_PALE, 0.10 + 0.90 * ringNorm)
+          .lerp(C_TIP, clamp(tipT * 0.60 + 0.16 * Math.pow(edgeT, 1.7)));
+        /* 瓣面受光：瓣根压在下面偏暗、中段最亮、瓣尖略回收，
+           这样一层层的明暗才出得来（纯等亮度的散点会像贴纸） */
+        tmp.multiplyScalar(coreFill ? 0.88 : 0.56 + 0.44 * lambert);   // 按瓣面法线打光，明暗是光算出来的
+        if (coreFill) tmp.copy(C_DEEP).lerp(C_CORE, 0.12);            // 花心那团：深粉压住，别烧成白球
+        if (ringIdx === 0) tmp.lerp(C_CORE, 0.20);                    // 最内圈蘸一点金
+        tmp.offsetHSL((Math.random() - 0.5) * 0.010, 0, (Math.random() - 0.5) * 0.05);
+        tmp.offsetHSL(0, 0, (vein - 0.5) * 0.035 * (0.35 + 0.65 * uu));
 
         colors[o] = tmp.r; colors[o + 1] = tmp.g; colors[o + 2] = tmp.b;
         info[i * 4] = seed;
-        info[i * 4 + 1] = 0.25 + Math.random() * 0.55;   // 尺寸系数
+        info[i * 4 + 1] = 0.30 + Math.random() * 0.48;   // 尺寸系数
         info[i * 4 + 2] = 0;                              // 角色：花瓣
-        info[i * 4 + 3] = layer ? 1 : 0;                  // 层级（影响拧转）
+        info[i * 4 + 3] = ringNorm;                       // 圈层（影响拧转）
 
       } else if (isCore) {
         /* ---------- 花心金粉：密集的小球，撑出那个亮核 ---------- */
@@ -1450,18 +1526,18 @@ class FlowerField {
      顶点着色器就能做到：笔尖扫到这里 → 这颗粒子从花那边飞过来就位。
 
    时间轴（秒）：
-     vanish 0.45  花淡出（所有粒子消失）
-     write  2.40  笔从 x=左 写到 x=右，"Love" 一笔一笔出现
-     hold   1.60  停住
-     return 0.90  文字淡出、花回来
+     vanish 0.70  花淡出（所有粒子消失）
+     write  7.20  笔从 x=左 写到 x=右，"Love" 一笔一笔出现
+     hold   3.20  停住
+     return 1.30  文字淡出、花回来
    ========================================================================== */
 
 /** 彩蛋时间轴（秒）：想整体调快慢就改这里 */
 const LOVE_TIMING = {
-  vanish: 0.45,   // 花淡出、所有粒子消失
-  write: 4.60,    // 一笔一笔写出来（原来 2.4 太快，放慢接近一倍）
-  hold: 2.40,     // 写完停住，让人看清
-  return: 0.90,   // 文字淡出、花回来
+  vanish: 0.70,   // 花淡出、所有粒子消失（慢一点，别突然黑一下）
+  write: 7.20,    // 一笔一笔写出来（放到 7.2 秒，笔尖走过整幅字的观感才从容）
+  hold: 3.20,     // 写完停住，让人看清楚
+  return: 1.30,   // 文字淡出、花回来
 };
 
 const LOVE_VERT = /* glsl */ `
